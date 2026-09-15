@@ -1,0 +1,13 @@
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [".venv", "notebooks", "data", "models"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]   # line length is handled by black
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+extend-exclude = '/(notebooks|\.venv)/'

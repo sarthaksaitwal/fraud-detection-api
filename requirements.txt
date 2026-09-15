@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------
+# Runtime dependencies. Install:  pip install -r requirements.txt
+# Grouped by the phase that first needs them.
+# ---------------------------------------------------------------
+
+# --- Phase 0/1: data + model ---
+numpy>=1.26,<3
+pandas>=2.1,<3
+scikit-learn>=1.4,<2
+scipy>=1.11
+joblib>=1.3
+
+# --- Phase 1 (optional): supervised baseline for comparison ---
+xgboost>=2.0,<4
+
+# --- Phase 2: API layer ---
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30
+pydantic>=2.7,<3
+pydantic-settings>=2.3,<3
+structlog>=24.1
+
+# --- Phase 3: persistence ---
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.1
+
+# --- Phase 4: streaming ---
+aiokafka>=0.10
+
+# --- Phase 5: velocity features ---
+redis>=5.0
+
+# --- Phase 6: dashboard + metrics ---
+streamlit>=1.35
+prometheus-client>=0.20
+plotly>=5.20
