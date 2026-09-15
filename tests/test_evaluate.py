@@ -3,7 +3,13 @@
 import numpy as np
 import pytest
 
-from src.ml.evaluate import bootstrap_pr_auc, confusion_at, summary_metrics, threshold_table
+from src.ml.evaluate import (
+    bootstrap_pr_auc,
+    budget_table,
+    confusion_at,
+    summary_metrics,
+    threshold_table,
+)
 
 # Hand-checkable example. At threshold 0.9 rows 1, 2 and 5 are flagged:
 #   rows 2, 5 are fraud -> tp = 2    row 1 is normal -> fp = 1
@@ -84,3 +90,27 @@ def test_bootstrap_is_reproducible_with_a_seed(noisy):
     assert bootstrap_pr_auc(*noisy, n_resamples=30, seed=7) == bootstrap_pr_auc(
         *noisy, n_resamples=30, seed=7
     )
+
+
+def test_budget_table_counts_fraud_in_the_top_rows():
+    # Top 3 of 10 by score: 0.9 (fraud), 0.8 (normal), 0.7 (fraud).
+    y = [0, 1, 0, 1, 1, 0, 0, 0, 0, 0]
+    scores = [0.1, 0.9, 0.8, 0.7, 0.2, 0.3, 0.05, 0.01, 0.02, 0.03]
+    row = budget_table(y, scores, budgets=[0.3]).iloc[0]
+    assert row["alerts"] == 3
+    assert row["tp"] == 2
+    assert row["precision"] == pytest.approx(2 / 3)
+    assert row["recall"] == pytest.approx(2 / 3)
+
+
+def test_budget_table_ignores_score_scale(noisy):
+    y, risk = noisy
+    as_percentile = budget_table(y, risk, budgets=[0.01, 0.05])
+    as_log_odds = budget_table(y, np.log(risk + 1e-9) * 10 - 3, budgets=[0.01, 0.05])
+    assert as_percentile["tp"].tolist() == as_log_odds["tp"].tolist()
+
+
+def test_zero_budget_alerts_nothing():
+    row = budget_table(Y, RISK, budgets=[0.0]).iloc[0]
+    assert row["alerts"] == 0
+    assert np.isnan(row["precision"])

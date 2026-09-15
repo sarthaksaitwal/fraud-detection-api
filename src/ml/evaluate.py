@@ -15,6 +15,7 @@ from numpy.typing import ArrayLike
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 DEFAULT_THRESHOLDS = (0.9, 0.95, 0.98, 0.99, 0.995, 0.998, 0.999)
+DEFAULT_BUDGETS = (0.0005, 0.001, 0.002, 0.005, 0.01, 0.02)
 
 
 def _validate(y_true: ArrayLike, risk: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
@@ -133,3 +134,34 @@ def bootstrap_pr_auc(
     tail = (1 - confidence) / 2
     low, high = np.quantile(scores, [tail, 1 - tail])
     return float(low), float(high)
+
+
+def budget_table(
+    y_true: ArrayLike, scores: ArrayLike, budgets: Iterable[float] = DEFAULT_BUDGETS
+) -> pd.DataFrame:
+    """Precision and recall when only the top `budget` share of rows is alerted.
+
+    Comparing models at the same alert volume is fair even when their scores
+    live on different scales (a percentile risk vs a predicted probability).
+    Ties are broken by row order.
+    """
+    y, s = _validate(y_true, scores)
+    order = np.argsort(-s, kind="stable")
+    caught_within_top = np.cumsum(y[order])
+    total_fraud = y.sum()
+
+    rows = []
+    for budget in budgets:
+        alerts = int(round(budget * y.size))
+        tp = int(caught_within_top[alerts - 1]) if alerts else 0
+        rows.append(
+            {
+                "budget_%": 100 * budget,
+                "alerts": alerts,
+                "tp": tp,
+                "precision": tp / alerts if alerts else np.nan,
+                "recall": tp / total_fraud,
+                "alerts_per_fraud": alerts / tp if tp else np.inf,
+            }
+        )
+    return pd.DataFrame(rows)

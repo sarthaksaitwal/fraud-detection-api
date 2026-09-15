@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from src.ml.thresholds import (
+    PROBABILITY_THRESHOLDS,
     Costs,
     approve_all_cost_per_100k,
     choose_thresholds,
@@ -115,3 +116,11 @@ def test_free_blocks_mean_blocking_replaces_review(overlapping):
     costs = Costs(review_cost=5.0, false_block_cost=0.0, chargeback_fee=15.0)
     choice = choose_thresholds(policy_costs(*overlapping, costs), max_review_rate=1.0)
     assert choice.block_threshold is not None
+
+
+def test_probability_grid_is_sorted_unique_and_inside_zero_one():
+    grid = np.array(PROBABILITY_THRESHOLDS)
+    assert len(grid) == 108
+    assert np.all(np.diff(grid) > 0)
+    assert grid[0] == 0.001
+    assert grid[-1] == 0.99

@@ -43,7 +43,7 @@ class Settings(BaseSettings):
 
     # ------------------------------------------- artifact filenames (Phase 1)
     raw_data_filename: str = "creditcard.csv"
-    model_filename: str = "isolation_forest.joblib"
+    model_filename: str = "fraud_model.joblib"
     model_metadata_filename: str = "model_metadata.json"
 
     # ------------------------------------------------- training hyperparams
@@ -53,11 +53,11 @@ class Settings(BaseSettings):
     max_samples: int | Literal["auto"] = "auto"
 
     # --------------------------------------------------- decision thresholds
-    # Chosen in Step 1.6 (notebooks/006_thresholds.ipynb) by minimising expected
-    # cost on training data under the assumptions below. Risk is a percentile of
-    # normal traffic, so risk >= t sends about (1 - t) of normal traffic onward.
-    review_threshold: float = Field(0.983, ge=0, le=1)  # >= this -> analyst review
-    block_threshold: float | None = Field(None, ge=0, le=1)  # >= this -> block; None = never
+    # Risk is the XGBoost model's predicted fraud probability. Thresholds were
+    # chosen in notebooks/008_xgboost_thresholds.ipynb by minimising expected cost
+    # on out-of-fold probabilities under the assumptions below.
+    review_threshold: float = Field(0.24, ge=0, le=1)  # >= this -> analyst review
+    block_threshold: float | None = Field(0.95, ge=0, le=1)  # >= this -> block; None = never
 
     # ------------------------------- cost assumptions used to choose thresholds
     review_cost: float = Field(5.0, ge=0)  # $ of analyst time per reviewed transaction

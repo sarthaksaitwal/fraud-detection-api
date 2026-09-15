@@ -6,8 +6,8 @@ from sklearn.ensemble import IsolationForest
 from sklearn.pipeline import Pipeline
 
 from src.config import settings
+from src.ml.isolation_forest import build_model, fit_on_normal, normal_only
 from src.ml.preprocess import RAW_FEATURES, TARGET, split
-from src.ml.train import build_model, fit_on_normal, normal_only
 
 
 @pytest.fixture

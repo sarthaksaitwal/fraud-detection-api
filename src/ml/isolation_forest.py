@@ -1,8 +1,8 @@
-"""Model construction and training.
+"""Isolation Forest: the unsupervised model from Steps 1.3 to 1.6.
 
-Step 1.3 builds and fits the forest; Step 1.4 calibrates its scores into a 0-1
-risk. Step 1.9 adds the runnable entrypoint that evaluates the model and writes
-the artifact to disk.
+Kept for the research notebooks (003 to 007). It is not the product model:
+Step 1.7 showed a supervised XGBoost model is about 10x better on this data,
+so the API serves src/ml/model.py instead.
 """
 
 from __future__ import annotations

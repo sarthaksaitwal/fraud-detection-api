@@ -5,9 +5,9 @@ import pickle
 import numpy as np
 import pytest
 
+from src.ml.isolation_forest import fit_risk_model
 from src.ml.preprocess import split
 from src.ml.risk import RiskCalibrator
-from src.ml.train import fit_risk_model
 
 # Stand-in for the raw scores of normal traffic.
 REFERENCE = np.linspace(-0.6, -0.4, 1001)

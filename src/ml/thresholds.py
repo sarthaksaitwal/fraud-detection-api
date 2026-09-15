@@ -28,7 +28,14 @@ from numpy.typing import ArrayLike
 
 from src.config import settings
 
+# Grid for the Isolation Forest's percentile risk (Step 1.6).
 CANDIDATE_THRESHOLDS = tuple(float(t) for t in np.round(np.arange(0.900, 0.9995, 0.001), 3))
+# Grid for XGBoost's fraud probability: 0.001 steps below 0.01, where review
+# thresholds tend to land, then 0.01 steps up to 0.99.
+PROBABILITY_THRESHOLDS = tuple(
+    float(t)
+    for t in np.unique(np.round(np.r_[np.arange(1, 10) / 1000, np.arange(1, 100) / 100], 3))
+)
 
 
 @dataclass(frozen=True)
