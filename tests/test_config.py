@@ -26,14 +26,19 @@ def test_model_artifact_name():
     assert settings.raw_data_path.name == "creditcard.csv"
 
 
-def test_flag_threshold_must_not_undercut_review_threshold():
+def test_block_threshold_must_not_undercut_review_threshold():
     with pytest.raises(ValidationError):
-        Settings(review_threshold=0.8, flag_threshold=0.2)
+        Settings(review_threshold=0.8, block_threshold=0.2)
 
 
 def test_thresholds_are_bounded():
     with pytest.raises(ValidationError):
-        Settings(flag_threshold=1.5)
+        Settings(block_threshold=1.5)
+
+
+def test_block_threshold_can_be_disabled_from_the_environment(monkeypatch):
+    monkeypatch.setenv("BLOCK_THRESHOLD", "none")
+    assert Settings().block_threshold is None
 
 
 def test_get_settings_is_cached():

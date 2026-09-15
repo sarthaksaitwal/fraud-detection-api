@@ -27,6 +27,8 @@ class Settings(BaseSettings):
         extra="ignore",
         # Pydantic v2 reserves the "model_" prefix; we use it for real fields.
         protected_namespaces=(),
+        # BLOCK_THRESHOLD=none in .env means "never block automatically".
+        env_parse_none_str="none",
     )
 
     # ------------------------------------------------------------------ app
@@ -51,8 +53,17 @@ class Settings(BaseSettings):
     max_samples: int | Literal["auto"] = "auto"
 
     # --------------------------------------------------- decision thresholds
-    review_threshold: float = Field(0.50, ge=0, le=1)  # >= this -> manual review
-    flag_threshold: float = Field(0.70, ge=0, le=1)  # >= this -> block/flag
+    # Chosen in Step 1.6 (notebooks/006_thresholds.ipynb) by minimising expected
+    # cost on training data under the assumptions below. Risk is a percentile of
+    # normal traffic, so risk >= t sends about (1 - t) of normal traffic onward.
+    review_threshold: float = Field(0.983, ge=0, le=1)  # >= this -> analyst review
+    block_threshold: float | None = Field(None, ge=0, le=1)  # >= this -> block; None = never
+
+    # ------------------------------- cost assumptions used to choose thresholds
+    review_cost: float = Field(5.0, ge=0)  # $ of analyst time per reviewed transaction
+    false_block_cost: float = Field(50.0, ge=0)  # $ per legitimate customer blocked
+    chargeback_fee: float = Field(15.0, ge=0)  # $ on top of the amount for missed fraud
+    max_review_rate: float = Field(0.02, gt=0, le=1)  # analyst capacity, share of traffic
 
     # ----------------------------------------------------- storage (Phase 3)
     database_url: str = "postgresql+psycopg://fraud:fraud@localhost:5432/fraud"
@@ -109,9 +120,9 @@ class Settings(BaseSettings):
     # ----------------------------------------------------------------------
     @model_validator(mode="after")
     def _thresholds_are_ordered(self) -> Settings:
-        if self.flag_threshold < self.review_threshold:
+        if self.block_threshold is not None and self.block_threshold < self.review_threshold:
             raise ValueError(
-                f"flag_threshold ({self.flag_threshold}) must be >= "
+                f"block_threshold ({self.block_threshold}) must be >= "
                 f"review_threshold ({self.review_threshold})"
             )
         return self
