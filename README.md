@@ -13,8 +13,8 @@ Producer ──► Kafka ──► Consumer ──► Postgres ──► Dashboa
 ```
 
 The plan is for one scoring function to serve both paths: a synchronous HTTP call
-and an asynchronous stream consumer. The model work (Phase 1) is nearly finished;
-the service around it starts in Phase 2.
+and an asynchronous stream consumer. The model (Phase 1) is finished; the service
+around it starts in Phase 2.
 
 ## Results so far
 
@@ -52,7 +52,7 @@ set. **These costs are illustrative, not industry figures;** they live in `.env`
 ## Status
 
 - [x] **Phase 0**: project skeleton, configuration, dependencies
-- [ ] **Phase 1**: the model
+- [x] **Phase 1**: the model
   - [x] 1.1 Explore the data
   - [x] 1.2 Deduplicate, stratified split, preprocessing pipeline
   - [x] 1.3 Isolation Forest trained on normal transactions
@@ -61,7 +61,7 @@ set. **These costs are illustrative, not industry figures;** they live in `.env`
   - [x] 1.6 Cost-based review/block thresholds
   - [x] 1.7 XGBoost comparison, adopted as the product model; thresholds redone
   - [x] 1.8 Save the model with versioned metadata
-  - [ ] 1.9 One-command training script
+  - [x] 1.9 One-command training script
 - [ ] **Phase 2**: FastAPI scoring service
 - [ ] **Phase 3**: Docker Compose + Postgres persistence
 - [ ] **Phase 4**: Kafka producer/consumer (the "real time" part)
@@ -80,9 +80,17 @@ bash scripts/download_data.sh        # needs a Kaggle API token
 pytest
 ```
 
-Until the training script lands (Step 1.9), build the model by running these
-notebooks in order: `002_preprocess` (creates the train/test split), then
-`009_export_model` (trains and saves `models/fraud_model.joblib`).
+Then build the model (about 45 seconds):
+
+```bash
+python -m src.ml.train
+```
+
+This deduplicates and splits the data, chooses review/block thresholds on out-of-fold
+predictions, trains XGBoost, evaluates it on the test set, and writes
+`models/fraud_model.joblib` and `models/model_metadata.json`. If the thresholds it
+chooses differ from `.env`, it logs the values to set. Training is reproducible:
+rebuilding produces a byte-identical model file.
 
 ## How it works
 
@@ -106,6 +114,7 @@ notebooks in order: `002_preprocess` (creates the train/test split), then
 | Path | What lives there |
 |---|---|
 | `src/config.py` | every path, threshold, cost assumption and connection string |
+| `src/ml/train.py` | the one-command training pipeline |
 | `src/ml/preprocess.py` | loading, deduplication, split, preprocessing pipeline |
 | `src/ml/model.py` | the XGBoost fraud model and out-of-fold scoring |
 | `src/ml/thresholds.py` | cost model and threshold selection |
@@ -114,7 +123,7 @@ notebooks in order: `002_preprocess` (creates the train/test split), then
 | `src/ml/isolation_forest.py`, `src/ml/risk.py` | the unsupervised model from Steps 1.3–1.6, kept for the research notebooks |
 | `src/api/`, `src/streaming/`, `src/storage/`, `src/features/` | Phases 2–5 (not built yet) |
 | `notebooks/` | one notebook per step, each ending in a findings cell; nothing imports from here |
-| `tests/` | 75 tests; run with `pytest` |
+| `tests/` | 80 tests; run with `pytest` |
 
 Notebooks: `001_explore` · `002_preprocess` · `003_isolation_forest` · `004_risk_score` ·
 `005_evaluation` · `006_thresholds` · `007_xgboost_baseline` · `008_xgboost_thresholds` ·
