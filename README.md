@@ -1,20 +1,20 @@
 # fraud-detection-api
 
 Real-time transaction risk scoring in the spirit of Stripe Radar: an XGBoost fraud
-model that returns **approve / review / block** for each transaction, to be served
-behind FastAPI and fed by a Kafka stream.
+model that returns **approve / review / block** for each transaction, served
+behind FastAPI and, from Phase 4, fed by a Kafka stream.
 
 ```
 Producer ──► Kafka ──► Consumer ──► Postgres ──► Dashboard
                           │
-                     scoring core  ◄── FastAPI  POST /score
+                     scoring core  ◄── FastAPI  POST /score, /score/batch
                           │
                models/fraud_model.joblib
 ```
 
-The plan is for one scoring function to serve both paths: a synchronous HTTP call
-and an asynchronous stream consumer. The model (Phase 1) is finished; the service
-around it starts in Phase 2.
+One scoring function serves both paths: the synchronous HTTP API and, from Phase 4,
+the asynchronous stream consumer. The model (Phase 1) and the scoring API (Phase 2)
+are finished; storage and streaming come next.
 
 ## Results so far
 
@@ -49,6 +49,16 @@ fraud let through, with analyst capacity capped at 2% of traffic. They were chos
 on out-of-fold predictions from the training data, then checked once on the test
 set. **These costs are illustrative, not industry figures;** they live in `.env`.
 
+**Serving: measured locally on a laptop, one uvicorn process**
+
+| | Time |
+|---|---|
+| `POST /score`, one transaction, in the server | 10–20 ms |
+| `POST /score/batch`, 1,000 transactions, HTTP round trip | about 220 ms (0.22 ms per transaction) |
+
+Replaying the whole test set through `/score/batch` gives exactly the decisions
+above: 47 reviews and 32 blocks.
+
 ## Status
 
 - [x] **Phase 0**: project skeleton, configuration, dependencies
@@ -62,7 +72,12 @@ set. **These costs are illustrative, not industry figures;** they live in `.env`
   - [x] 1.7 XGBoost comparison, adopted as the product model; thresholds redone
   - [x] 1.8 Save the model with versioned metadata
   - [x] 1.9 One-command training script
-- [ ] **Phase 2**: FastAPI scoring service
+- [x] **Phase 2**: FastAPI scoring service
+  - [x] 2.1 Request and response schemas with strict validation
+  - [x] 2.2 Scoring core shared by the API and the future stream consumer
+  - [x] 2.3 FastAPI app: model loaded at startup, `GET /health`, `POST /score`
+  - [x] 2.4 `POST /score/batch`, JSON 422 and 500 errors
+  - [x] 2.5 Request logging with latency and request ids, sample request script
 - [ ] **Phase 3**: Docker Compose + Postgres persistence
 - [ ] **Phase 4**: Kafka producer/consumer (the "real time" part)
 - [ ] **Phase 5**: Redis velocity features
@@ -80,7 +95,7 @@ bash scripts/download_data.sh        # needs a Kaggle API token
 pytest
 ```
 
-Then build the model (about 45 seconds):
+Build the model (about 45 seconds):
 
 ```bash
 python -m src.ml.train
@@ -91,6 +106,59 @@ predictions, trains XGBoost, evaluates it on the test set, and writes
 `models/fraud_model.joblib` and `models/model_metadata.json`. If the thresholds it
 chooses differ from `.env`, it logs the values to set. Training is reproducible:
 rebuilding produces a byte-identical model file.
+
+Serve it:
+
+```bash
+uvicorn src.api.main:app --reload --no-access-log
+```
+
+Interactive docs are at http://127.0.0.1:8000/docs. To send a real transaction, write
+one from the test set and post it:
+
+```bash
+python -m scripts.sample_request --decision block --out data/samples/block.json
+curl -X POST http://127.0.0.1:8000/score \
+     -H "Content-Type: application/json" -d @data/samples/block.json
+```
+
+```json
+{
+  "transaction_id": "test-row-95238",
+  "risk_score": 0.9863,
+  "decision": "block",
+  "review_threshold": 0.24,
+  "block_threshold": 0.95,
+  "model_version": "20260915-071627-19429cbb"
+}
+```
+
+`--decision` accepts `approve`, `review` or `block`; `--batch N` writes a
+`/score/batch` body. Use `--out` rather than `>`: in Windows PowerShell, `>` writes
+UTF-16, which the API rejects.
+
+## API
+
+| Endpoint | Body | Returns |
+|---|---|---|
+| `GET /health` | | `status`, the model version and thresholds being served |
+| `POST /score` | one transaction: `Time`, `V1`–`V28`, `Amount`, optional `transaction_id` | risk score, decision, thresholds, model version |
+| `POST /score/batch` | `{"transactions": [...]}`, 1–1,000 with unique ids | `{"results": [...]}` in request order |
+
+- **Decisions:** `block` if risk ≥ `BLOCK_THRESHOLD`, otherwise `review` if risk ≥
+  `REVIEW_THRESHOLD`, otherwise `approve`. Thresholds come from `.env`; the service
+  logs a warning at startup if they differ from the ones stored with the model.
+- **422:** a missing, misspelled or extra field, text, NaN, infinity, a negative
+  `Time` or `Amount`, or a bad batch. The body lists each bad field's location and
+  the reason, without echoing the values sent. A batch is all or nothing.
+- **500:** `{"detail": "internal server error"}`. The traceback goes to the server
+  log only.
+- **Logging:** one line per request with method, path, status, latency and an
+  `X-Request-ID`, which is also returned as a response header. A client's own
+  `X-Request-ID` is kept if it is 1–64 letters, digits, `.`, `_` or `-`. Transaction
+  values are never logged.
+- **Startup:** the model is loaded and checked once. If it is missing or does not
+  match its metadata, the server refuses to start.
 
 ## How it works
 
@@ -108,6 +176,13 @@ rebuilding produces a byte-identical model file.
    `model_metadata.json`: version, SHA-256, input feature order, thresholds, test
    metrics and library versions. Loading checks the SHA-256 before unpickling and
    warns if library versions differ.
+5. **Scoring core** (`src/scoring.py`). The only code that turns transactions into
+   decisions: one model call per list of transactions, the same `>=` rule the
+   thresholds were priced with. A single transaction is a list of one, so single
+   and batch scoring always agree.
+6. **API** (`src/api/`). Pydantic schemas validate every request before it reaches
+   the model; routes are thin wrappers around the scoring core. Scoring routes are
+   plain `def`, so CPU work runs in a worker thread instead of blocking the server.
 
 ## Layout
 
@@ -121,9 +196,14 @@ rebuilding produces a byte-identical model file.
 | `src/ml/evaluate.py` | PR-AUC, threshold and alert-budget tables, bootstrap intervals |
 | `src/ml/artifact.py` | saving and loading the model with metadata |
 | `src/ml/isolation_forest.py`, `src/ml/risk.py` | the unsupervised model from Steps 1.3–1.6, kept for the research notebooks |
-| `src/api/`, `src/streaming/`, `src/storage/`, `src/features/` | Phases 2–5 (not built yet) |
+| `src/scoring.py` | the scoring core: model + thresholds → decisions |
+| `src/api/main.py` | the FastAPI app: startup, request logging, error handlers |
+| `src/api/schemas.py` | request and response bodies |
+| `src/api/routes/` | `/health`, `/score`, `/score/batch` |
+| `scripts/sample_request.py` | writes real test-set transactions as request bodies |
+| `src/streaming/`, `src/storage/`, `src/features/` | Phases 3–5 (not built yet) |
 | `notebooks/` | one notebook per step, each ending in a findings cell; nothing imports from here |
-| `tests/` | 80 tests; run with `pytest` |
+| `tests/` | 143 tests; run with `pytest` |
 
 Notebooks: `001_explore` · `002_preprocess` · `003_isolation_forest` · `004_risk_score` ·
 `005_evaluation` · `006_thresholds` · `007_xgboost_baseline` · `008_xgboost_thresholds` ·
@@ -149,3 +229,5 @@ of the imbalance, models are judged on **PR-AUC and precision/recall**, never ac
 - **Thresholds belong to one model.** The probability scale shifts between retrains,
   so thresholds must be re-checked each time the model is retrained.
 - **Pickled models run code when loaded.** Only load model files you trained yourself.
+- **The API is a local demo.** It has no authentication, rate limiting or TLS, and
+  the latency figures come from one process on a laptop, not a load test (Phase 6).
