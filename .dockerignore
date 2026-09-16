@@ -1,0 +1,14 @@
+# Allowlist: nothing enters the build context unless it is named here. The
+# context is everything `docker build` uploads, so .env (secrets), data/
+# (218 MB) and .venv never leave your machine, and a new file is excluded
+# until someone decides the image needs it.
+*
+
+!requirements-api.txt
+!src/
+!models/fraud_model.joblib
+!models/model_metadata.json
+
+# Re-excluded from inside the allowed folders.
+**/__pycache__
+**/*.py[cod]

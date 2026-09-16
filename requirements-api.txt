@@ -1,0 +1,22 @@
+# Exactly what the serving image installs (Step 3.3). Pinned, not ranged: the model
+# is a pickle, and it must be loaded with the library versions it was trained with.
+# tests/test_requirements.py fails if these drift from the training environment.
+
+# --- the model: must match models/model_metadata.json "library_versions"
+numpy==2.2.6
+pandas==2.3.3
+scikit-learn==1.7.2
+# The CPU-only build of the same library, without ~200 MB of CUDA libraries.
+xgboost-cpu==3.2.0
+scipy==1.15.3
+joblib==1.6.0
+
+# --- the API
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+
+# --- the decision store
+SQLAlchemy==2.0.53
+psycopg[binary]==3.3.5

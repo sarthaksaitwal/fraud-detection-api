@@ -25,4 +25,9 @@ lint:     ## ruff + black check
 fmt:      ## autoformat
 	$(PY) -m ruff check --fix . && $(PY) -m black .
 
+image:    ## build the API image                         (Phase 3)
+	docker build -t fraud-detection-api .
+
+
 .PHONY: help install data train api test lint fmt
+
