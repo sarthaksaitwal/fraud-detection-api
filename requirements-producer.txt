@@ -1,0 +1,5 @@
+# The producer image: everything in the API image, plus reading the test split (Step 4.6).
+# Kept out of the API image, which never reads parquet files.
+-r requirements-api.txt
+
+pyarrow==25.0.1

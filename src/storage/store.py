@@ -79,11 +79,12 @@ class DecisionStore:
             self._down_until = self._clock() + self._retry_after
             self._unrecorded += lost
             unrecorded = self._unrecorded
+        # Callers that retry (the Kafka consumer) lose nothing, so there is no count.
+        lost = f" ({unrecorded} decision(s) not recorded so far)" if unrecorded else ""
         log.error(
-            "decision store unavailable, retrying in %.0fs (%d decision(s) not recorded "
-            "so far): %s",
+            "decision store unavailable, retrying in %.0fs%s: %s",
             self._retry_after,
-            unrecorded,
+            lost,
             failure_reason(exc),
         )
 
@@ -120,10 +121,15 @@ class DecisionStore:
                 create_schema(self.engine)
                 self._schema_ready = True
 
-    def record(self, results: Sequence[RiskResult]) -> bool:
-        """Save decisions. Never raises for a database failure; returns whether it worked."""
+    def record(self, results: Sequence[RiskResult], will_retry: bool = False) -> bool:
+        """Save decisions. Never raises for a database failure; returns whether it worked.
+
+        will_retry: the caller keeps the decisions and tries again (the Kafka
+        consumer does), so a failure is not counted as decisions lost.
+        """
+        lost = 0 if will_retry else len(results)
         try:
-            self._use_database(lambda s: save_decisions(s, results), lost_on_failure=len(results))
+            self._use_database(lambda s: save_decisions(s, results), lost_on_failure=lost)
         except (SQLAlchemyError, StoreUnavailableError):
             return False
         return True

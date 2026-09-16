@@ -1,4 +1,4 @@
-# Exactly what the serving image installs (Step 3.3). Pinned, not ranged: the model
+# Exactly what the API and consumer image installs (Steps 3.3, 4.6). Pinned, not ranged: the model
 # is a pickle, and it must be loaded with the library versions it was trained with.
 # tests/test_requirements.py fails if these drift from the training environment.
 
@@ -20,3 +20,6 @@ pydantic-settings==2.15.0
 # --- the decision store
 SQLAlchemy==2.0.53
 psycopg[binary]==3.3.5
+
+# --- the Kafka consumer
+aiokafka==0.14.0

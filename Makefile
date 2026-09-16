@@ -28,14 +28,17 @@ fmt:      ## autoformat
 image:    ## build the API image                         (Phase 3)
 	docker build -t fraud-detection-api .
 
-up:       ## start the API and Postgres in Docker        (Phase 3)
+up:       ## start the pipeline in Docker: API, consumer, Postgres, Kafka
 	docker compose up -d --build
 
 down:     ## stop the containers; decisions are kept
 	docker compose down
 
-logs:     ## follow the API logs
-	docker compose logs -f api
+logs:     ## follow the API and consumer logs
+	docker compose logs -f api consumer
+
+stream:   ## stream 1,000 test transactions in through the producer container (Phase 4)
+	docker compose run --rm producer --limit 1000 --rate 100
 
 psql:     ## open a SQL shell on the Compose database
 	docker compose exec postgres psql -U fraud -d fraud
@@ -46,5 +49,20 @@ init-db:  ## create the decisions table in DATABASE_URL  (Phase 3)
 test-postgres:  ## run only the tests that need Postgres (make up first)
 	$(PY) -m pytest -m postgres -rs
 
-.PHONY: help install data train api test lint fmt image up down logs psql init-db test-postgres
+kafka:    ## start Kafka and create its topics          (Phase 4)
+	docker compose up -d kafka kafka-init
+
+check-kafka:  ## check Kafka answers and the topics exist
+	$(PY) -m scripts.check_kafka
+
+test-kafka:  ## run only the tests that need Kafka (make kafka first)
+	$(PY) -m pytest -m kafka -rs
+
+produce:  ## stream the test set into Kafka at PRODUCER_RATE_PER_SEC
+	$(PY) -m scripts.produce
+
+consume:  ## score transactions from Kafka into Postgres (Ctrl+C to stop)
+	$(PY) -m scripts.consume
+
+.PHONY: help install data train api test lint fmt image up down logs psql init-db test-postgres kafka check-kafka test-kafka produce consume stream
 

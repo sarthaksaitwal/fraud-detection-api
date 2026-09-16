@@ -1,14 +1,26 @@
-# The API and its database (Step 3.4).
+# The whole pipeline: API, consumer, Postgres and Kafka (Steps 3.4, 4.1, 4.6).
 #
-#   docker compose up -d --build     # or: make up
-#   docker compose logs -f api
-#   docker compose down              # stops everything; decisions are kept
-#   docker compose down -v           # also deletes the database volume
+#   docker compose up -d --build                        # or: make up
+#   docker compose run --rm producer --limit 1000       # stream transactions in (make stream)
+#   docker compose logs -f consumer
+#   docker compose down                                 # stops everything; data is kept
+#   docker compose down -v                              # also deletes the database and Kafka volumes
 #
 # Values like ${POSTGRES_PORT:-5433} come from .env in this folder if set there,
-# otherwise the default after ":-". Phases 4 and 5 add Kafka and Redis here.
+# otherwise the default after ":-". Phase 5 adds Redis here.
 
 name: fraud-detection
+
+# Settings the API and the consumer must share, so a transaction gets the same
+# decision whichever way it arrives. Not `env_file: .env`, which would also bring
+# in the 127.0.0.1 addresses that are wrong inside a container.
+x-scoring-environment: &scoring-environment
+  # Inside the Compose network services are reached by their service names.
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-fraud}:${POSTGRES_PASSWORD:-fraud}@postgres:5432/${POSTGRES_DB:-fraud}
+  PERSIST_DECISIONS: "true"
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  REVIEW_THRESHOLD: ${REVIEW_THRESHOLD:-0.24}
+  BLOCK_THRESHOLD: ${BLOCK_THRESHOLD:-0.95}
 
 services:
   postgres:
@@ -35,7 +47,9 @@ services:
     restart: unless-stopped
 
   api:
-    build: .
+    build:
+      context: .
+      target: service
     image: fraud-detection-api
     depends_on:
       postgres:
@@ -43,17 +57,132 @@ services:
         # has started. The API would recover without this, but would log a warning.
         condition: service_healthy
     environment:
-      # Inside the Compose network the database is reached by its service name.
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-fraud}:${POSTGRES_PASSWORD:-fraud}@postgres:5432/${POSTGRES_DB:-fraud}
-      PERSIST_DECISIONS: "true"
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      # Serve the same thresholds as a local run. Not `env_file: .env`, which would
-      # also bring in the localhost URLs that are wrong inside a container.
-      REVIEW_THRESHOLD: ${REVIEW_THRESHOLD:-0.24}
-      BLOCK_THRESHOLD: ${BLOCK_THRESHOLD:-0.95}
+      <<: *scoring-environment
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     restart: unless-stopped
 
+  kafka:
+    # KRaft mode: the broker runs its own controller, so there is no ZooKeeper
+    # service. Pinned: Kafka 4 removed old protocol versions that clients rely on.
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Two doors into the same broker. A client connects, then the broker tells it
+      # which address to use from then on, so each door must advertise an address
+      # that works from where that client runs:
+      #   INTERNAL  kafka:29092     for containers on the Compose network
+      #   EXTERNAL  127.0.0.1:9092  for scripts and tests on your machine
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://127.0.0.1:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # One broker, so every internal topic can only have one copy.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      # Topics are created on purpose by kafka-init. Auto-creation would turn a typo
+      # in a topic name into a new, silently empty topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Messages are kept for 7 days whether or not they have been read.
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # A consumer joining an empty group starts at once instead of waiting 3s.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # The default 1 GB heap is more than a laptop demo needs.
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+    volumes:
+      # Messages and consumer offsets survive `docker compose down`.
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      # EXTERNAL listener only, on 127.0.0.1. Use 127.0.0.1, not localhost, in
+      # KAFKA_BOOTSTRAP_SERVERS for the same IPv6 reason as DATABASE_URL.
+      - "127.0.0.1:9092:9092"
+    healthcheck:
+      # Asks the broker for its API versions through the address other containers
+      # use, so "healthy" means the INTERNAL listener really answers.
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "kafka:29092"]
+      interval: 10s
+      timeout: 15s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  kafka-init:
+    # Runs once, creates the topics if they are missing, and exits. Services that
+    # read or write them wait for it with `condition: service_completed_successfully`.
+    image: apache/kafka:4.3.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        topics=/opt/kafka/bin/kafka-topics.sh
+        # 3 partitions: up to 3 consumers in the fraud-scorer group can share the work.
+        $$topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic ${KAFKA_TOPIC:-transactions} --partitions 3 --replication-factor 1
+        # 1 partition: dead letters are rare and read by people, in arrival order.
+        $$topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic ${KAFKA_DLQ_TOPIC:-transactions.dlq} --partitions 1 --replication-factor 1
+        $$topics --bootstrap-server kafka:29092 --describe --topic ${KAFKA_TOPIC:-transactions}
+        $$topics --bootstrap-server kafka:29092 --describe --topic ${KAFKA_DLQ_TOPIC:-transactions.dlq}
+    restart: "no"
+
+  consumer:
+    # The API's image, running scripts/consume.py instead of the web server.
+    build:
+      context: .
+      target: service
+    image: fraud-detection-api
+    command: ["python", "-m", "scripts.consume"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *scoring-environment
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-transactions}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-transactions.dlq}
+      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-fraud-scorer}
+      CONSUMER_MAX_BATCH: ${CONSUMER_MAX_BATCH:-500}
+    # The image's health check calls the API's /health, which the consumer does not
+    # serve. Consumer lag is the real health signal; Phase 6 exposes it as a metric.
+    healthcheck:
+      disable: true
+    # On `docker compose stop` the consumer finishes and commits its current batch.
+    # A batch takes well under a second; 30s leaves room for a slow database.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  producer:
+    # A stand-in for the card network, run on demand rather than started by `up`:
+    #   docker compose run --rm producer --limit 1000 --rate 50
+    build:
+      context: .
+      target: producer
+    image: fraud-detection-producer
+    profiles: ["tools"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-transactions}
+      PRODUCER_RATE_PER_SEC: ${PRODUCER_RATE_PER_SEC:-20}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      # The test split written by `python -m src.ml.train`, read-only.
+      - ./data/processed:/app/data/processed:ro
+
 volumes:
   postgres-data:
+  kafka-data:

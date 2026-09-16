@@ -1,11 +1,14 @@
 """Fixtures shared across test modules."""
 
+import asyncio
 import os
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 import pytest
+from aiokafka.admin import NewTopic
+from aiokafka.errors import KafkaError
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -13,6 +16,7 @@ from src.config import settings
 from src.ml.preprocess import TARGET, V_COLUMNS
 from src.storage.db import create_db_engine
 from src.storage.store import failure_reason
+from src.streaming.kafka import MissingTopicsError, admin_client, partition_counts
 
 # The columns that separate fraud most strongly in the real data (Step 1.1, Cell 9).
 FRAUD_SIGNAL_COLUMNS = ["V3", "V10", "V12", "V14", "V17"]
@@ -53,6 +57,72 @@ def postgres_engine():
     with admin.begin() as connection:
         connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
     admin.dispose()
+
+
+@pytest.fixture(scope="session")
+def kafka_bootstrap():
+    """The bootstrap servers of a running Kafka broker, or a skip if none answers.
+
+    Uses TEST_KAFKA_BOOTSTRAP_SERVERS, else KAFKA_BOOTSTRAP_SERVERS: normally the
+    Compose broker from `make kafka`.
+    """
+    servers = os.environ.get("TEST_KAFKA_BOOTSTRAP_SERVERS", settings.kafka_bootstrap_servers)
+
+    async def connect():
+        async with admin_client(servers):
+            pass
+
+    try:
+        asyncio.run(connect())
+    except KafkaError as exc:
+        pytest.skip(f"no Kafka answering at {servers}: {type(exc).__name__}")
+    return servers
+
+
+@pytest.fixture
+def make_topic(kafka_bootstrap):
+    """Creates new topics for one test and deletes them afterwards.
+
+    Tests never touch the real topics. Kafka confirms a new topic before it
+    shows up in metadata, and code that checks for its topic straight away
+    would call it missing, so this waits until the topic can be seen.
+    """
+    created = []
+
+    async def create(name, partitions):
+        async with admin_client(kafka_bootstrap) as admin:
+            await admin.create_topics(
+                [NewTopic(name, num_partitions=partitions, replication_factor=1)]
+            )
+            for _ in range(50):
+                try:
+                    if (await partition_counts(admin, [name]))[name] == partitions:
+                        return
+                except MissingTopicsError:
+                    pass
+                await asyncio.sleep(0.1)
+            raise TimeoutError(f"topic {name} was created but never appeared")
+
+    def make(partitions=1):
+        name = f"test-{uuid4().hex[:12]}"
+        asyncio.run(create(name, partitions))
+        created.append(name)
+        return name
+
+    yield make
+
+    async def delete():
+        async with admin_client(kafka_bootstrap) as admin:
+            await admin.delete_topics(created)
+
+    if created:
+        asyncio.run(delete())
+
+
+@pytest.fixture
+def throwaway_topic(make_topic):
+    """A new one-partition topic, deleted after the test."""
+    return make_topic()
 
 
 @pytest.fixture

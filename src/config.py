@@ -71,11 +71,14 @@ class Settings(BaseSettings):
     persist_decisions: bool = True
 
     # --------------------------------------------------- streaming (Phase 4)
-    kafka_bootstrap_servers: str = "localhost:9092"
+    # 127.0.0.1, not localhost: Compose listens on IPv4 only (see DATABASE_URL).
+    kafka_bootstrap_servers: str = "127.0.0.1:9092"
     kafka_topic: str = "transactions"
     kafka_dlq_topic: str = "transactions.dlq"
     kafka_consumer_group: str = "fraud-scorer"
     producer_rate_per_sec: float = 20.0
+    # Messages scored per model call and saved per database write by the consumer.
+    consumer_max_batch: int = Field(500, ge=1, le=10_000)
 
     # ------------------------------------------------------- redis (Phase 5)
     redis_url: str = "redis://localhost:6379/0"
