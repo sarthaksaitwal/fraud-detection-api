@@ -2,21 +2,25 @@
 
 Real-time transaction risk scoring in the spirit of Stripe Radar: an XGBoost fraud
 model that returns **approve / review / block** for each transaction, served
-behind FastAPI, recorded in Postgres and, from Phase 4, fed by a Kafka stream.
+behind FastAPI and a Kafka stream, with every decision recorded in Postgres.
 
 ```
-Producer ──► Kafka ──► Consumer ──┐                    (Phase 4)
-                                  ▼
-             FastAPI ──► scoring core ──► decision store ──► Postgres ──► Dashboard
-   POST /score, /score/batch      │                              ▲
-   GET /transactions              │                              │
-                       models/fraud_model.joblib      GET /transactions
+                   ┌──────────── transactions.dlq  (messages that are not transactions)
+                   │
+Producer ──► Kafka "transactions" ──► Consumer ──┐
+                                                 ▼
+    client ──► FastAPI ──────────────────► scoring core ──► decision store ──► Postgres
+       POST /score, /score/batch                 │                                │
+       GET /transactions ◄───────────────────────┼────────────────────────────────┘
+                                   models/fraud_model.joblib
 ```
 
-One scoring function and one decision store serve both paths: the synchronous HTTP
-API and, from Phase 4, the asynchronous stream consumer. The model (Phase 1), the
-scoring API (Phase 2) and decision storage with Docker Compose (Phase 3) are
-finished; streaming comes next.
+Two ways in, one set of rules. A client that needs an answer now calls the API and
+waits about 36 ms. A stream of transactions goes through Kafka, where the consumer
+scores them in batches of 500 with nobody waiting. Both paths use the same schema,
+the same scoring code and the same store, so a transaction gets the same decision
+whichever way it arrives. The model (Phase 1), the API (Phase 2), storage and
+Docker Compose (Phase 3) and streaming (Phase 4) are finished.
 
 ## Results so far
 
@@ -78,6 +82,27 @@ Replaying it a second time leaves the row count unchanged.
 | Container health | stayed `healthy` |
 | After Postgres came back | recording resumed within 10 s; the log reported 142 decisions not recorded |
 
+**Streaming: the whole test set through Kafka**
+
+| | |
+|---|---|
+| Producer, full speed | 56,746 transactions in 8.2 s (about 6,900/s) |
+| Consumer, real model and Postgres | about 1,850 transactions/s, in batches of 500 |
+| Decisions recorded | 56,667 approve, 47 review, 32 block: the same as the API and the test-set evaluation |
+| Committed offsets afterwards | equal to the end of each of the 3 partitions (lag 0) |
+| Replayed under a new consumer group | the same 56,746 rows, none duplicated |
+
+**Database outage on the stream: Postgres stopped for 30 seconds mid-run**
+
+| | |
+|---|---|
+| What the consumer did | paused its partitions, held its batch of 500, retried 5 times, resumed after 33 s |
+| Transactions recorded | **56,746 of 56,746**: nothing lost |
+| Committed offsets | equal to the end of every partition |
+
+The API answers a waiting caller, so it can lose decisions during an outage. The
+consumer has nobody waiting, so it waits for the database instead.
+
 ## Status
 
 - [x] **Phase 0**: project skeleton, configuration, dependencies
@@ -103,7 +128,13 @@ Replaying it a second time leaves the row count unchanged.
   - [x] 3.3 Docker image: pinned libraries matching the model, non-root, health check
   - [x] 3.4 Docker Compose with Postgres; retry window so a database outage stays fast
   - [x] 3.5 Storage tests on real Postgres, schema script
-- [ ] **Phase 4**: Kafka producer/consumer (the "real time" part)
+- [x] **Phase 4**: Kafka producer/consumer (the "real time" part)
+  - [x] 4.1 Kafka in Compose (KRaft, two listeners), topics created on startup
+  - [x] 4.2 Message format: JSON keyed by `transaction_id`, the API's schema, dead letters
+  - [x] 4.3 Producer: the test set in time order at a steady rate, resumable
+  - [x] 4.4 Consumer: batches, deduplicate, score, record, then commit
+  - [x] 4.5 Database outages: pause, retry, lose nothing
+  - [x] 4.6 Consumer and producer in Docker Compose
 - [ ] **Phase 5**: Redis velocity features
 - [ ] **Phase 6**: Streamlit dashboard, Prometheus metrics, load test
 
@@ -131,11 +162,11 @@ predictions, trains XGBoost, evaluates it on the test set, and writes
 chooses differ from `.env`, it logs the values to set. Training is reproducible:
 rebuilding produces a byte-identical model file.
 
-Serve it with its database, in Docker (needs Docker Desktop and the trained model):
+Run the whole pipeline in Docker (needs Docker Desktop and the trained model):
 
 ```bash
-docker compose up -d --build         # or: make up
-docker compose ps                    # api and postgres both "(healthy)"
+docker compose up -d --build         # or: make up; the first build takes a few minutes
+docker compose ps                    # api, postgres, kafka "(healthy)"; consumer "Up"
 ```
 
 Or run the API directly for development, against the Compose database or none:
@@ -181,8 +212,55 @@ docker compose down                                          # decisions are kep
 
 The Compose Postgres listens on `127.0.0.1:5433`, not 5432, which a locally
 installed Postgres often already uses. Use `127.0.0.1` rather than `localhost` in
-`DATABASE_URL`: on Windows `localhost` tries IPv6 first, which Compose does not
-listen on, and each new connection then waits about 5 seconds.
+`DATABASE_URL` and `KAFKA_BOOTSTRAP_SERVERS`: on Windows `localhost` tries IPv6
+first, which Compose does not listen on, and each new connection then waits about
+5 seconds.
+
+## Streaming
+
+Send test-set transactions into Kafka and watch the consumer score them:
+
+```bash
+docker compose run --rm producer --limit 1000 --rate 100    # or: make stream
+docker compose logs -f consumer
+curl "http://127.0.0.1:8000/transactions?decision=block&limit=5"
+```
+
+```
+INFO src.streaming.consumer consumed 3000 message(s) in 8 batch(es), 20.5s: scored 3000
+     (2990 approve, 9 review, 1 block), 0 dead-lettered, 0 duplicate(s) skipped; lag 0
+```
+
+The producer and consumer also run on your machine, against the Compose broker:
+
+```bash
+python -m scripts.check_kafka                          # topics and partitions
+python -m scripts.produce --rate 0                     # the whole test set, full speed
+python -m scripts.produce --rate 20 --start 1000       # resume from position 1000
+python -m scripts.consume --until-idle 10              # stop once the topic is drained
+python -m scripts.consume --group candidate-model      # replay the topic separately
+```
+
+- **Messages:** the key is `transaction_id`; the value is the same JSON body
+  `POST /score` takes, checked with the same schema. The stream is stricter in one
+  way: `transaction_id` is required, because a generated id would give a redelivered
+  message a new id and store it twice.
+- **Producer:** sends the test set in time order (`Time`), with ids
+  `test-row-<row>`, at `--rate` per second on a fixed schedule. Kafka confirms every
+  message (`acks=all`, idempotent). Ctrl+C stops cleanly and prints the `--start`
+  that resumes after the last confirmed message.
+- **Consumer:** for each batch it decodes every message, sends failures to
+  `transactions.dlq` (the original bytes, plus the reason and source partition and
+  offset in headers), drops repeated ids, scores with one model call, records with
+  one insert, and **commits the offsets only after recording**. A crash before the
+  commit means the batch is read again; recording is an upsert, so that is harmless.
+- **Database outages:** the consumer pauses its partitions, keeps polling so Kafka
+  does not hand its partitions to another consumer, and retries with growing delays
+  (1, 2, 4, 8, then 15 s). Nothing is committed until the decisions are recorded.
+- **Stopping:** Ctrl+C or `docker compose stop consumer` finishes and commits the
+  batch in hand, in about 2 s. A restart continues after the last commit.
+- **Replay:** a new `--group` reads the whole topic from the start, which is how a
+  candidate model could be compared with the live one. Messages are kept for 7 days.
 
 ## API
 
@@ -258,6 +336,20 @@ listen on, and each new connection then waits about 5 seconds.
    is a pickle and must load under the libraries it was trained with (`xgboost-cpu`
    leaves out ~200 MB of GPU libraries). Compose adds Postgres 16 with a health
    check and a named volume, and publishes both ports on `127.0.0.1` only.
+9. **Kafka** (`docker-compose.yml`, `src/streaming/kafka.py`). One Kafka 4.3 broker
+   in KRaft mode with two listeners: `kafka:29092` for containers and
+   `127.0.0.1:9092` for your machine. A broker tells each client which address to
+   use next, so each listener advertises one that works from where its clients run.
+   `kafka-init` creates `transactions` (3 partitions) and `transactions.dlq` (1).
+   Automatic topic creation is off, so a misspelled topic name fails at startup
+   instead of creating an empty topic that a consumer would wait on forever.
+10. **Stream processing** (`src/streaming/`). `messages.py` defines the message
+    format and dead letters, `producer.py` paces and confirms sends, and
+    `consumer.py` runs the decode → dead-letter → deduplicate → score → record →
+    commit cycle, with scoring and database work in a worker thread so the Kafka
+    session stays alive. The consumer runs the API's image with a different command;
+    the producer has its own build target, which adds a parquet reader the API does
+    not need.
 
 ## Layout
 
@@ -282,11 +374,16 @@ listen on, and each new connection then waits about 5 seconds.
 | `src/storage/db.py` | connection pool, sessions, timeouts, schema creation |
 | `scripts/sample_request.py` | writes real test-set transactions as request bodies |
 | `scripts/init_db.py` | creates the table if missing and reports what it holds |
-| `Dockerfile`, `requirements-api.txt`, `.dockerignore` | the API image and its pinned libraries |
-| `docker-compose.yml` | the API and Postgres together |
-| `src/streaming/`, `src/features/` | Phases 4–5 (not built yet) |
+| `src/streaming/kafka.py` | connecting to Kafka and checking its topics |
+| `src/streaming/messages.py` | message format, validation and dead letters |
+| `src/streaming/producer.py`, `scripts/produce.py` | streams the test set into Kafka |
+| `src/streaming/consumer.py`, `scripts/consume.py` | scores the stream and records the decisions |
+| `scripts/check_kafka.py` | checks that Kafka answers and the topics exist |
+| `Dockerfile`, `requirements-api.txt`, `requirements-producer.txt`, `.dockerignore` | the API/consumer and producer images and their pinned libraries |
+| `docker-compose.yml` | the pipeline: API, consumer, Postgres, Kafka, and the producer on demand |
+| `src/features/` | Phase 5 (not built yet) |
 | `notebooks/` | one notebook per step, each ending in a findings cell; nothing imports from here |
-| `tests/` | 214 tests; run with `pytest`. Storage tests run on SQLite and, when `docker compose up` is running, on real Postgres too (`pytest -m postgres`); without it those are skipped |
+| `tests/` | 297 tests; run with `pytest`. Storage tests run on SQLite and, with `docker compose up`, on real Postgres too (`pytest -m postgres`). Kafka tests (`pytest -m kafka`) use throwaway topics on the Compose broker. Without the services running, those tests are skipped |
 
 Notebooks: `001_explore` · `002_preprocess` · `003_isolation_forest` · `004_risk_score` ·
 `005_evaluation` · `006_thresholds` · `007_xgboost_baseline` · `008_xgboost_thresholds` ·
@@ -315,9 +412,16 @@ of the imbalance, models are judged on **PR-AUC and precision/recall**, never ac
 - **The API is a local demo.** It has no authentication, rate limiting or TLS, and
   the latency figures come from one process on a laptop, not a load test (Phase 6).
   The Compose database password is a demo value.
-- **Recording can lose decisions.** Recording is best effort, so decisions made
-  while Postgres is down, or in the 10 seconds after it returns, are logged as a
-  count but not stored. Writing each decision to a stream first (Phase 4) is the
-  real fix.
+- **The API can lose decisions; the stream cannot.** `POST /score` records best
+  effort, so decisions made while Postgres is down, or in the 10 seconds after it
+  returns, are logged as a count but not stored. The Kafka consumer waits for the
+  database instead and loses nothing. A caller that needs both an immediate answer
+  and a guaranteed record would also write the transaction to Kafka.
+- **One Kafka broker.** Every topic has a single copy, so losing the broker's volume
+  loses unconsumed messages. A production cluster runs three or more brokers with
+  replicated topics.
+- **The consumer reports no health.** Compose switches off its health check because
+  it serves no HTTP endpoint; consumer lag is only in its logs until Phase 6 exports
+  metrics.
 - **No schema migrations.** The table is created if it is missing but never
   altered. Changing a column needs a migration tool such as Alembic.
