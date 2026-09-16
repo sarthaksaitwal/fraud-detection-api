@@ -4,10 +4,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src.config import settings
 from src.ml.preprocess import TARGET, V_COLUMNS
 
 # The columns that separate fraud most strongly in the real data (Step 1.1, Cell 9).
 FRAUD_SIGNAL_COLUMNS = ["V3", "V10", "V12", "V14", "V17"]
+
+
+@pytest.fixture(autouse=True)
+def no_configured_database(monkeypatch):
+    """No test writes to the database in .env. Tests that need one open their own."""
+    monkeypatch.setattr(settings, "persist_decisions", False)
 
 
 @pytest.fixture

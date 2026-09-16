@@ -45,6 +45,7 @@ def test_health_reports_the_model_being_served(client):
         "model_version": "v-test",
         "review_threshold": 0.24,
         "block_threshold": 0.95,
+        "decision_store": "disabled",
     }
 
 

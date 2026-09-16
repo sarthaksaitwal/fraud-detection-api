@@ -9,7 +9,9 @@ infinity. Invalid requests get a 422 response that names the bad field.
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime
 from enum import Enum
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -107,8 +109,24 @@ class BatchResult(BaseModel):
     results: list[RiskResult]
 
 
+class StoredDecision(RiskResult):
+    """A decision as it was recorded, including when it was made."""
+
+    # Built straight from a database row (DecisionRecord) by model_validate.
+    model_config = ConfigDict(from_attributes=True)
+
+    scored_at: datetime = Field(description="when the decision was made (UTC)")
+
+
+class DecisionList(BaseModel):
+    decisions: list[StoredDecision]
+
+
 class HealthResponse(BaseModel):
     status: str
     model_version: str
     review_threshold: float
     block_threshold: float | None
+    decision_store: Literal["ok", "unavailable", "disabled"] = Field(
+        description="unavailable: scoring still works, but decisions are not being recorded"
+    )

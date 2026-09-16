@@ -1,11 +1,13 @@
-"""The FastAPI application (Steps 2.3-2.5).
+"""The FastAPI application (Steps 2.3-2.5, 3.2).
 
     uvicorn src.api.main:app --reload --no-access-log   # development, from the repo root
     python -m src.api.main                              # uses API_HOST and API_PORT from .env
 
 The model is loaded once, at startup. If it cannot be loaded (missing file,
 SHA-256 mismatch, bad thresholds) the server refuses to start, rather than
-running without a model and failing every request.
+running without a model and failing every request. The decision store is
+opened at startup too, but a database that is down only produces a warning:
+see src/storage/store.py.
 
 Every request is logged once, with its status, latency and request id:
 
@@ -24,10 +26,12 @@ from uuid import uuid4
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
 
-from src.api.routes import health, score
+from src.api.routes import health, score, transactions
 from src.config import settings
 from src.scoring import Scorer
+from src.storage.store import DecisionStore, failure_reason, open_configured_store
 
 log = logging.getLogger("src.api")
 
@@ -72,13 +76,22 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     return JSONResponse(status_code=422, content={"detail": detail})
 
 
+async def store_unavailable_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
+    """503 when a read from the decision store fails. Scoring routes never get here."""
+    log.error("decision store error: %s", failure_reason(exc))
+    return JSONResponse(status_code=503, content={"detail": "decision store unavailable"})
+
+
 async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """500 with a generic JSON body. The traceback goes to the server log, not the caller."""
     return JSONResponse(status_code=500, content={"detail": "internal server error"})
 
 
-def create_app(load_scorer: Callable[[], Scorer] = Scorer.load) -> FastAPI:
-    """Build the app. Tests pass their own `load_scorer` to avoid the real model file."""
+def create_app(
+    load_scorer: Callable[[], Scorer] = Scorer.load,
+    open_store: Callable[[], DecisionStore | None] = open_configured_store,
+) -> FastAPI:
+    """Build the app. Tests pass their own loaders to avoid the real model and database."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -86,7 +99,12 @@ def create_app(load_scorer: Callable[[], Scorer] = Scorer.load) -> FastAPI:
             level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s"
         )
         app.state.scorer = load_scorer()
-        yield
+        app.state.store = open_store()
+        try:
+            yield
+        finally:
+            if app.state.store is not None:
+                app.state.store.close()
 
     app = FastAPI(
         title=settings.app_name,
@@ -95,9 +113,11 @@ def create_app(load_scorer: Callable[[], Scorer] = Scorer.load) -> FastAPI:
     )
     app.middleware("http")(log_requests)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
+    app.add_exception_handler(SQLAlchemyError, store_unavailable_handler)
     app.add_exception_handler(Exception, unexpected_error_handler)
     app.include_router(health.router)
     app.include_router(score.router)
+    app.include_router(transactions.router)
     return app
 
 

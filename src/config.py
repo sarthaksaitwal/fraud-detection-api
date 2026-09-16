@@ -67,6 +67,8 @@ class Settings(BaseSettings):
 
     # ----------------------------------------------------- storage (Phase 3)
     database_url: str = "postgresql+psycopg://fraud:fraud@localhost:5432/fraud"
+    # Record every decision in the database. false: the API scores without one.
+    persist_decisions: bool = True
 
     # --------------------------------------------------- streaming (Phase 4)
     kafka_bootstrap_servers: str = "localhost:9092"
