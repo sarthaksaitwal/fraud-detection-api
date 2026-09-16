@@ -31,7 +31,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from src.api.routes import health, score, transactions
 from src.config import settings
 from src.scoring import Scorer
-from src.storage.store import DecisionStore, failure_reason, open_configured_store
+from src.storage.store import DecisionStore, StoreUnavailableError, open_configured_store
 
 log = logging.getLogger("src.api")
 
@@ -76,9 +76,11 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     return JSONResponse(status_code=422, content={"detail": detail})
 
 
-async def store_unavailable_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
-    """503 when a read from the decision store fails. Scoring routes never get here."""
-    log.error("decision store error: %s", failure_reason(exc))
+async def store_unavailable_handler(request: Request, exc: Exception) -> JSONResponse:
+    """503 when a read from the decision store fails. Scoring routes never get here.
+
+    The store has already logged why (src/storage/store.py).
+    """
     return JSONResponse(status_code=503, content={"detail": "decision store unavailable"})
 
 
@@ -114,6 +116,7 @@ def create_app(
     app.middleware("http")(log_requests)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(SQLAlchemyError, store_unavailable_handler)
+    app.add_exception_handler(StoreUnavailableError, store_unavailable_handler)
     app.add_exception_handler(Exception, unexpected_error_handler)
     app.include_router(health.router)
     app.include_router(score.router)

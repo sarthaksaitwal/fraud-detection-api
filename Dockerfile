@@ -53,9 +53,11 @@ USER app
 EXPOSE 8000
 
 # Docker marks the container unhealthy if /health stops answering. Python
-# instead of curl, which the slim image does not include.
-HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
-    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+# instead of curl, which the slim image does not include. The 10s timeout allows
+# for /health's database probe, which takes ~4s when the database has vanished:
+# a slow answer still proves the API is alive.
+HEALTHCHECK --interval=15s --timeout=10s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=9)"]
 
 # Exec form: uvicorn is PID 1 and receives `docker stop`'s SIGTERM directly, so
 # it finishes in-flight requests and closes the database pool before exiting.

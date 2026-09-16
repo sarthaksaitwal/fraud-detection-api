@@ -1,4 +1,4 @@
-"""Step 3.2 guard rails: the best-effort decision store."""
+"""Steps 3.2 and 3.4 guard rails: the best-effort decision store."""
 
 import logging
 
@@ -9,7 +9,7 @@ from src.api.schemas import Decision, RiskResult
 from src.config import settings
 from src.storage import store as store_module
 from src.storage.db import create_db_engine
-from src.storage.store import DecisionStore, open_configured_store
+from src.storage.store import DecisionStore, StoreUnavailableError, open_configured_store
 
 
 def result(transaction_id="tx-1", decision=Decision.REVIEW):
@@ -27,20 +27,51 @@ def sqlite_url(path):
     return f"sqlite:///{path.as_posix()}"
 
 
+class FakeClock:
+    """Time that only moves when a test says so."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
 @pytest.fixture
-def store(tmp_path):
-    decision_store = DecisionStore(create_db_engine(sqlite_url(tmp_path / "decisions.db")))
+def clock():
+    return FakeClock()
+
+
+@pytest.fixture
+def store(tmp_path, clock):
+    decision_store = DecisionStore(
+        create_db_engine(sqlite_url(tmp_path / "decisions.db")), retry_after=10, clock=clock
+    )
     yield decision_store
     decision_store.close()
 
 
 @pytest.fixture
-def unreachable(tmp_path):
-    """A database that cannot be opened yet: its directory does not exist."""
+def unreachable(tmp_path, clock):
+    """A database that cannot be opened until its directory is created."""
     path = tmp_path / "not-yet" / "decisions.db"
-    decision_store = DecisionStore(create_db_engine(sqlite_url(path)))
+    decision_store = DecisionStore(create_db_engine(sqlite_url(path)), retry_after=10, clock=clock)
     yield decision_store
     decision_store.close()
+
+
+@pytest.fixture
+def attempts(monkeypatch):
+    """Counts how often the store actually goes to the database."""
+    calls = []
+    real = store_module.create_schema
+
+    def counting(engine):
+        calls.append(engine)
+        real(engine)
+
+    monkeypatch.setattr(store_module, "create_schema", counting)
+    return calls
 
 
 def test_recorded_decisions_can_be_read_back(store):
@@ -61,7 +92,8 @@ def test_ping_reports_whether_the_database_answers(store, unreachable):
 def test_recording_to_an_unreachable_database_logs_instead_of_raising(unreachable, caplog):
     with caplog.at_level(logging.ERROR, logger="src.storage"):
         assert unreachable.record([result()]) is False
-    assert "could not record 1 decision(s): OperationalError" in caplog.text
+    assert "unavailable, retrying in 10s (1 decision(s) not recorded" in caplog.text
+    assert "OperationalError" in caplog.text
 
 
 def test_reading_from_an_unreachable_database_raises(unreachable):
@@ -69,11 +101,40 @@ def test_reading_from_an_unreachable_database_raises(unreachable):
         unreachable.get("tx-1")
 
 
-def test_recording_recovers_when_the_database_comes_back(tmp_path, unreachable):
-    assert unreachable.record([result("tx-1")]) is False
+def test_after_a_failure_the_database_is_left_alone_until_the_window_passes(
+    unreachable, clock, attempts
+):
+    unreachable.record([result("tx-1")])
+    clock.now += 9
+    assert unreachable.record([result("tx-2")]) is False
+    assert not unreachable.ping()
+    with pytest.raises(StoreUnavailableError):
+        unreachable.get("tx-1")
+    assert len(attempts) == 1
+
+    clock.now += 1
+    unreachable.record([result("tx-3")])
+    assert len(attempts) == 2
+
+
+def test_recording_recovers_and_reports_what_was_lost(tmp_path, unreachable, clock, caplog):
+    unreachable.record([result("tx-1"), result("tx-2")])  # fails: 2 lost
+    unreachable.record([result("tx-3")])  # skipped during the window: 1 more lost
     (tmp_path / "not-yet").mkdir()
-    assert unreachable.record([result("tx-2")]) is True
-    assert unreachable.get("tx-2") is not None
+    clock.now += 10
+
+    with caplog.at_level(logging.WARNING, logger="src.storage"):
+        assert unreachable.record([result("tx-4")]) is True
+    assert "decision store is back; 3 decision(s) were not recorded" in caplog.text
+    assert unreachable.get("tx-4") is not None
+
+
+def test_a_successful_health_probe_also_ends_the_outage(tmp_path, unreachable, clock):
+    unreachable.record([result()])
+    (tmp_path / "not-yet").mkdir()
+    clock.now += 10
+    assert unreachable.ping()
+    assert not unreachable.is_resting()
 
 
 def test_failure_logs_contain_neither_sql_nor_row_values(unreachable, caplog):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
@@ -35,6 +35,7 @@ def save_decisions(
     if not results:
         return 0
 
+    scored_at = scored_at or utcnow()
     rows = [
         {
             "transaction_id": result.transaction_id,
@@ -43,7 +44,7 @@ def save_decisions(
             "review_threshold": result.review_threshold,
             "block_threshold": result.block_threshold,
             "model_version": result.model_version,
-            "scored_at": scored_at or utcnow(),
+            "scored_at": scored_at,
         }
         for result in results
     ]
@@ -80,3 +81,10 @@ def list_decisions(
         query = query.where(DecisionRecord.decision == decision.value)
     query = query.order_by(DecisionRecord.scored_at.desc(), DecisionRecord.transaction_id)
     return list(session.scalars(query.limit(limit)))
+
+
+def count_decisions(session: Session) -> dict[Decision, int]:
+    """How many stored decisions of each kind, including kinds with none."""
+    query = select(DecisionRecord.decision, func.count()).group_by(DecisionRecord.decision)
+    counts = dict(session.execute(query).tuples().all())
+    return {decision: counts.get(decision.value, 0) for decision in Decision}

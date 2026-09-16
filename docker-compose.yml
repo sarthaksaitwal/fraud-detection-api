@@ -1,0 +1,59 @@
+# The API and its database (Step 3.4).
+#
+#   docker compose up -d --build     # or: make up
+#   docker compose logs -f api
+#   docker compose down              # stops everything; decisions are kept
+#   docker compose down -v           # also deletes the database volume
+#
+# Values like ${POSTGRES_PORT:-5433} come from .env in this folder if set there,
+# otherwise the default after ":-". Phases 4 and 5 add Kafka and Redis here.
+
+name: fraud-detection
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fraud}
+      # A local demo credential. Anything shared needs a real secret instead.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud}
+      POSTGRES_DB: ${POSTGRES_DB:-fraud}
+    volumes:
+      # A named volume: decisions survive `docker compose down` and container rebuilds.
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # 127.0.0.1 only, so the database is not reachable from your network. 5433
+      # on your machine, because a locally installed Postgres usually owns 5432.
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    healthcheck:
+      # $$ passes a literal $ through to the container's shell.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: fraud-detection-api
+    depends_on:
+      postgres:
+        # Wait until Postgres accepts connections, not merely until its container
+        # has started. The API would recover without this, but would log a warning.
+        condition: service_healthy
+    environment:
+      # Inside the Compose network the database is reached by its service name.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-fraud}:${POSTGRES_PASSWORD:-fraud}@postgres:5432/${POSTGRES_DB:-fraud}
+      PERSIST_DECISIONS: "true"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Serve the same thresholds as a local run. Not `env_file: .env`, which would
+      # also bring in the localhost URLs that are wrong inside a container.
+      REVIEW_THRESHOLD: ${REVIEW_THRESHOLD:-0.24}
+      BLOCK_THRESHOLD: ${BLOCK_THRESHOLD:-0.95}
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

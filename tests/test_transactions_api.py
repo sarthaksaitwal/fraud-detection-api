@@ -115,7 +115,9 @@ def test_scoring_still_works_when_the_database_is_down(unreachable_client, trans
     assert single.status_code == 200
     assert single.json()["decision"] == "block"
     assert batch.status_code == 200
-    assert caplog.text.count("could not record") == 2
+    # The first request finds the database down; the second does not try again.
+    assert caplog.text.count("decision store unavailable, retrying") == 1
+    assert "1 decision(s) not recorded" in caplog.text
 
 
 def test_reads_are_a_503_when_the_database_is_down(unreachable_client):

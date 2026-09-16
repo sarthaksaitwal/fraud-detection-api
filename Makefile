@@ -28,6 +28,23 @@ fmt:      ## autoformat
 image:    ## build the API image                         (Phase 3)
 	docker build -t fraud-detection-api .
 
+up:       ## start the API and Postgres in Docker        (Phase 3)
+	docker compose up -d --build
 
-.PHONY: help install data train api test lint fmt
+down:     ## stop the containers; decisions are kept
+	docker compose down
+
+logs:     ## follow the API logs
+	docker compose logs -f api
+
+psql:     ## open a SQL shell on the Compose database
+	docker compose exec postgres psql -U fraud -d fraud
+
+init-db:  ## create the decisions table in DATABASE_URL  (Phase 3)
+	$(PY) -m scripts.init_db
+
+test-postgres:  ## run only the tests that need Postgres (make up first)
+	$(PY) -m pytest -m postgres -rs
+
+.PHONY: help install data train api test lint fmt image up down logs psql init-db test-postgres
 

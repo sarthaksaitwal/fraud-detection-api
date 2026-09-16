@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     max_review_rate: float = Field(0.02, gt=0, le=1)  # analyst capacity, share of traffic
 
     # ----------------------------------------------------- storage (Phase 3)
-    database_url: str = "postgresql+psycopg://fraud:fraud@localhost:5432/fraud"
+    database_url: str = "postgresql+psycopg://fraud:fraud@127.0.0.1:5433/fraud"
     # Record every decision in the database. false: the API scores without one.
     persist_decisions: bool = True
 

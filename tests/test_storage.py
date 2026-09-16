@@ -1,14 +1,26 @@
-"""Step 3.1 guard rails: the storage layer."""
+"""Steps 3.1 and 3.5 guard rails: the storage layer.
+
+Every test runs twice: on SQLite, which needs nothing installed, and on real
+Postgres, which is skipped unless one is running (`make up`). SQLite accepts
+some things Postgres refuses, so the SQLite run alone proves less than it seems.
+"""
 
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError, StatementError
 
 from src.api.schemas import Decision, RiskResult
+from src.storage import repository
 from src.storage.db import create_db_engine, create_schema, create_session_factory, session_scope
-from src.storage.models import DecisionRecord
-from src.storage.repository import get_decision, list_decisions, save_decisions
+from src.storage.models import Base, DecisionRecord
+from src.storage.repository import (
+    count_decisions,
+    get_decision,
+    list_decisions,
+    save_decisions,
+)
 
 
 def result(transaction_id="tx-1", risk=0.5, decision=Decision.REVIEW, **overrides):
@@ -24,13 +36,23 @@ def result(transaction_id="tx-1", risk=0.5, decision=Decision.REVIEW, **override
     return RiskResult(**(fields | overrides))
 
 
+@pytest.fixture(params=["sqlite", pytest.param("postgres", marks=pytest.mark.postgres)])
+def engine(request, tmp_path):
+    """An empty database: a SQLite file, or a throwaway schema in Postgres."""
+    if request.param == "sqlite":
+        sqlite = create_db_engine(f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
+        yield sqlite
+        sqlite.dispose()
+    else:
+        postgres = request.getfixturevalue("postgres_engine")
+        yield postgres
+        Base.metadata.drop_all(postgres)
+
+
 @pytest.fixture
-def sessions(tmp_path):
-    """A real database on disk, thrown away after the test."""
-    engine = create_db_engine(f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
+def sessions(engine):
     create_schema(engine)
-    yield create_session_factory(engine)
-    engine.dispose()
+    return create_session_factory(engine)
 
 
 def test_a_saved_decision_reads_back_unchanged(sessions):
@@ -148,3 +170,78 @@ def test_every_risk_result_field_is_persisted(sessions):
     """Adding a field to the API response must not silently stop being recorded."""
     columns = set(DecisionRecord.__table__.columns.keys())
     assert set(RiskResult.model_fields) <= columns
+
+
+def test_decisions_saved_together_share_one_timestamp(sessions, monkeypatch):
+    # A clock that moves on every call, so a per-row timestamp cannot pass by luck.
+    ticks = iter(range(1000))
+    base = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(repository, "utcnow", lambda: base + timedelta(seconds=next(ticks)))
+
+    with session_scope(sessions) as session:
+        save_decisions(session, [result(f"tx-{i}") for i in range(5)])
+    with session_scope(sessions) as session:
+        assert {d.scored_at for d in list_decisions(session)} == {base}
+
+
+def test_a_full_batch_is_written_in_one_statement(engine, sessions):
+    statements = []
+
+    def remember(connection, cursor, statement, *args):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", remember)
+    try:
+        with session_scope(sessions) as session:
+            save_decisions(session, [result(f"tx-{i}") for i in range(1000)])
+    finally:
+        event.remove(engine, "before_cursor_execute", remember)
+    assert sum(s.lstrip().upper().startswith("INSERT") for s in statements) == 1
+    with session_scope(sessions) as session:
+        assert len(list_decisions(session, limit=1000)) == 1000
+
+
+def test_a_timestamp_in_another_timezone_is_stored_as_the_same_instant(sessions):
+    india = timezone(timedelta(hours=5, minutes=30))
+    scored_at = datetime(2026, 9, 16, 17, 30, tzinfo=india)
+    with session_scope(sessions) as session:
+        save_decisions(session, [result()], scored_at)
+    with session_scope(sessions) as session:
+        stored = get_decision(session, "tx-1").scored_at
+    assert stored == datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+    assert stored.utcoffset() == timedelta(0)
+
+
+def test_the_database_refuses_a_risk_score_outside_0_to_1(sessions):
+    with pytest.raises(IntegrityError), session_scope(sessions) as session:
+        session.add(
+            DecisionRecord(
+                transaction_id="tx-1",
+                risk_score=1.5,
+                decision="block",
+                review_threshold=0.24,
+                block_threshold=0.95,
+                model_version="v-test",
+            )
+        )
+
+
+def test_postgres_refuses_the_same_id_twice_in_one_call(engine, sessions):
+    """Why the Phase 4 consumer must deduplicate a micro-batch before saving it."""
+    if engine.dialect.name != "postgresql":
+        pytest.skip("SQLite quietly applies both rows; only Postgres refuses")
+    with pytest.raises(StatementError), session_scope(sessions) as session:
+        save_decisions(session, [result("tx-1"), result("tx-1", decision=Decision.BLOCK)])
+
+
+def test_decisions_are_counted_by_kind(sessions):
+    with session_scope(sessions) as session:
+        assert count_decisions(session) == dict.fromkeys(Decision, 0)
+        save_decisions(
+            session,
+            [result("tx-a", 0.99, Decision.BLOCK), result("tx-b", 0.99, Decision.BLOCK)]
+            + [result("tx-c", 0.1, Decision.APPROVE)],
+        )
+    with session_scope(sessions) as session:
+        counts = count_decisions(session)
+    assert counts == {Decision.APPROVE: 1, Decision.REVIEW: 0, Decision.BLOCK: 2}
