@@ -1,8 +1,9 @@
 # fraud-detection-api
 
 Real-time transaction risk scoring in the spirit of Stripe Radar: an XGBoost fraud
-model that returns **approve / review / block** for each transaction, served
-behind FastAPI and a Kafka stream, with every decision recorded in Postgres.
+model that returns **approve / review / block** for each transaction, served behind
+FastAPI and a Kafka stream, with velocity rules on top and every decision recorded
+in Postgres.
 
 ```
                    ┌──────────── transactions.dlq  (messages that are not transactions)
@@ -10,17 +11,21 @@ behind FastAPI and a Kafka stream, with every decision recorded in Postgres.
 Producer ──► Kafka "transactions" ──► Consumer ──┐
                                                  ▼
     client ──► FastAPI ──────────────────► scoring core ──► decision store ──► Postgres
-       POST /score, /score/batch                 │                                │
-       GET /transactions ◄───────────────────────┼────────────────────────────────┘
-                                   models/fraud_model.joblib
+       POST /score, /score/batch                 │  ▲                             │
+       GET /transactions ◄───────────────────────┼──┼─────────────────────────────┘
+                                                 │  └── velocity ──► Redis
+                                   models/fraud_model.joblib      (what this card did recently)
 ```
 
 Two ways in, one set of rules. A client that needs an answer now calls the API and
 waits about 36 ms. A stream of transactions goes through Kafka, where the consumer
 scores them in batches of 500 with nobody waiting. Both paths use the same schema,
 the same scoring code and the same store, so a transaction gets the same decision
-whichever way it arrives. The model (Phase 1), the API (Phase 2), storage and
-Docker Compose (Phase 3) and streaming (Phase 4) are finished.
+whichever way it arrives. The model scores each transaction alone; the velocity
+rules then look at what the card has been doing and can send an approved
+transaction for review. The model (Phase 1), the API (Phase 2), storage and Docker
+Compose (Phase 3), streaming (Phase 4) and velocity features (Phase 5) are
+finished.
 
 ## Results so far
 
@@ -103,6 +108,50 @@ Replaying it a second time leaves the row count unchanged.
 The API answers a waiting caller, so it can lose decisions during an outage. The
 consumer has nobody waiting, so it waits for the database instead.
 
+**Velocity rules: what they cost**
+
+The model scores one transaction in isolation. The velocity rules add what the card
+has been doing: more than 5 transactions in a minute, 10 in an hour, 2 countries in
+an hour, or two payments within 2 seconds sends an approved transaction for review.
+
+| Thresholds | Share of traffic escalated |
+|---|---|
+| 2 countries / 20 an hour (first guess) | 2.88%, nearly all the country rule |
+| **3 countries / 10 an hour (shipped)** | **0.79%** |
+| 4 countries / 20 an hour | 0.05%: barely fires |
+
+Measured over the whole test set at **the pace the transactions really happened**,
+using the dataset's own `Time` column. With the model's own 0.14% review rate, the
+shipped thresholds keep the review queue near 0.9% of traffic, inside the 2% analyst
+capacity the cost model assumes.
+
+The same rules escalate **14.5%** of traffic when the producer replays at 100/s,
+because that compresses about 8.5 hours of card activity into 100 seconds. Velocity
+measures arrival time, so a fast replay makes every card look frantic; the
+compressed figure says nothing about a real deployment.
+
+**These rules cannot be shown to catch more fraud, and the project does not claim
+it.** Card ids here are synthetic and independent of the fraud label by
+construction, so any lift would be an artifact of the generator. What this measures
+is the cost: extra reviews, and about 1 ms of extra latency per transaction.
+
+| | |
+|---|---|
+| Velocity lookup, one transaction | 1 round trip, p50 1.8 ms, p95 3.8 ms |
+| Velocity lookup, batch of 500 | 1 round trip, 88 ms (0.18 ms each) |
+| `POST /score` with a card vs without | 22.8 ms vs 21.9 ms (median HTTP round trip, measured back to back) |
+| Redis memory | 2.2 MB per 5,000 events; about 20 MB for the whole test set |
+
+**Redis outage: Redis stopped under steady traffic**
+
+| | |
+|---|---|
+| `/score` requests answered | all `200`, with `"velocity": null` |
+| First request after the outage began | 4.0 s: the container name stops resolving, which no socket timeout covers |
+| The next requests | 20–38 ms each: Redis is left alone for 10 s after a failure |
+| `/health` | `200` in 8 ms, `"velocity": "unavailable"`, `"status": "ok"` |
+| After Redis came back | features resumed; the log reported 6 transactions scored without them |
+
 ## Status
 
 - [x] **Phase 0**: project skeleton, configuration, dependencies
@@ -135,7 +184,13 @@ consumer has nobody waiting, so it waits for the database instead.
   - [x] 4.4 Consumer: batches, deduplicate, score, record, then commit
   - [x] 4.5 Database outages: pause, retry, lose nothing
   - [x] 4.6 Consumer and producer in Docker Compose
-- [ ] **Phase 5**: Redis velocity features
+- [x] **Phase 5**: Redis velocity features
+  - [x] 5.1 Redis in Compose, a client that fails fast, `/health` reports it
+  - [x] 5.2 Synthetic card, merchant and country, derived from the transaction id
+  - [x] 5.3 Velocity store: one sorted set per card, one round trip per batch
+  - [x] 5.4 Features measured on both paths and stored with the decision
+  - [x] 5.5 Velocity rules: escalate to review, never block, and say why
+  - [x] 5.6 Redis outages: score without the features, and stop retrying for 10 s
 - [ ] **Phase 6**: Streamlit dashboard, Prometheus metrics, load test
 
 ## Quickstart
@@ -166,14 +221,14 @@ Run the whole pipeline in Docker (needs Docker Desktop and the trained model):
 
 ```bash
 docker compose up -d --build         # or: make up; the first build takes a few minutes
-docker compose ps                    # api, postgres, kafka "(healthy)"; consumer "Up"
+docker compose ps                    # api, postgres, kafka, redis "(healthy)"; consumer "Up"
 ```
 
 Or run the API directly for development, against the Compose database or none:
 
 ```bash
-docker compose up -d postgres        # optional: or set PERSIST_DECISIONS=false in .env
-uvicorn src.api.main:app --reload --no-access-log
+docker compose up -d postgres redis  # optional: or set PERSIST_DECISIONS=false and
+uvicorn src.api.main:app --reload --no-access-log   # VELOCITY_FEATURES=false in .env
 ```
 
 Interactive docs are at http://127.0.0.1:8000/docs. To send a real transaction, write
@@ -192,7 +247,14 @@ curl -X POST http://127.0.0.1:8000/score \
   "decision": "block",
   "review_threshold": 0.24,
   "block_threshold": 0.95,
-  "model_version": "20260915-071627-19429cbb"
+  "model_version": "20260915-071627-19429cbb",
+  "card_id": "card-04512",
+  "velocity": {
+    "count_1m": 2, "count_5m": 2, "count_1h": 2,
+    "amount_1h": 1389.2, "countries_1h": 1, "seconds_since_previous": 48.996
+  },
+  "model_decision": "block",
+  "reasons": []
 }
 ```
 
@@ -262,19 +324,78 @@ python -m scripts.consume --group candidate-model      # replay the topic separa
 - **Replay:** a new `--group` reads the whole topic from the start, which is how a
   candidate model could be compared with the live one. Messages are kept for 7 days.
 
+## Velocity features
+
+What a card did in the last minute is one of the oldest fraud signals there is, and
+the model cannot see it: it was trained on `V1`–`V28` and `Amount`, one transaction
+at a time. Phase 5 adds that memory in Redis and lets it escalate a decision.
+
+```bash
+docker compose up -d redis                             # or: make redis
+python -m scripts.check_redis                          # version, keys, memory, eviction policy
+docker compose run --rm producer --limit 2000 --rate 100
+curl "http://127.0.0.1:8000/transactions?decision=review&limit=5"
+```
+
+```json
+{
+  "transaction_id": "test-row-36125", "risk_score": 0.00008,
+  "card_id": "card-00000", "model_decision": "approve", "decision": "review",
+  "reasons": ["many_in_a_minute", "many_in_an_hour", "back_to_back"],
+  "velocity": {"count_1m": 40, "count_1h": 44, "countries_1h": 1, "…": "…"}
+}
+```
+
+A transaction the model scored at 0.00008 — as innocent as it gets — sent for review
+purely on its card's behaviour.
+
+- **Identities.** The Kaggle columns are PCA output, so no card, merchant or country
+  survived anonymisation and velocity would have nothing to count. The producer
+  invents them (`src/features/entities.py`) by hashing the transaction id: stable
+  across restarts and redeliveries, heavy-tailed so some cards are busy enough to
+  watch, and **never derived from the fraud label**, so the rules cannot be rigged to
+  look like they catch fraud. They are optional fields: a transaction without a card
+  is scored by the model alone.
+- **Storage.** One sorted set per card, `vel:card:<card_id>`, scored by arrival time,
+  with the amount and country inside the member so one read answers every feature.
+  Each measurement is five commands — trim, add, cap, read, expire — sent as one
+  pipeline, and a whole batch goes in one round trip.
+- **Features.** Transactions in the last 1 m / 5 m / 1 h, amount in the last hour,
+  distinct countries in the last hour, and seconds since that card's previous
+  transaction. They are returned with the score and stored with the decision.
+- **Rules** (`src/features/rules.py`). Thresholds live in `.env`. They escalate
+  `approve` to `review` and nothing else: a wrong block costs a customer their
+  payment ($50 in the cost model) against $5 for an analyst, so velocity can ask for
+  a human but never refuse a payment, and never soften a decision the model made.
+  Every rule that fires is named in the response and the stored row.
+- **Time is arrival time**, not the dataset's `Time` column. The producer replays two
+  days in minutes, so the dataset's clock would put every transaction in one window.
+- **Nothing in Redis is durable.** It runs with persistence off and a 256 MB ceiling
+  with `allkeys-lru`; every key is derived from transactions Kafka still holds, and a
+  card that goes quiet expires by itself within the hour.
+- **Redis outages.** The transaction is scored without its features, and the response
+  says `"velocity": null`. After a failure Redis is left alone for 10 seconds, so
+  only one transaction per window pays the ~4 s a vanished container name takes to
+  fail. `/health` reports `"velocity": "unavailable"` and stays `200`; when Redis
+  returns, the log says how many transactions went without.
+- **Switching it off.** `VELOCITY_FEATURES=false` scores on the transaction alone and
+  never opens a connection.
+
 ## API
 
 | Endpoint | Body | Returns |
 |---|---|---|
-| `GET /health` | | `status`, the model version and thresholds being served, `decision_store`: `ok`, `unavailable` or `disabled` |
-| `POST /score` | one transaction: `Time`, `V1`–`V28`, `Amount`, optional `transaction_id` | risk score, decision, thresholds, model version |
+| `GET /health` | | `status`, the model version and thresholds being served, `decision_store` and `velocity`: `ok`, `unavailable` or `disabled` |
+| `POST /score` | one transaction: `Time`, `V1`–`V28`, `Amount`, optional `transaction_id`, `card_id`, `merchant`, `country` | risk score, decision, thresholds, model version, velocity features and the rules that fired |
 | `POST /score/batch` | `{"transactions": [...]}`, 1–1,000 with unique ids | `{"results": [...]}` in request order |
 | `GET /transactions/{transaction_id}` | | the recorded decision plus `scored_at`, or 404 |
 | `GET /transactions?decision=block&limit=50` | | `{"decisions": [...]}`, newest first; `limit` 1–500 |
 
 - **Decisions:** `block` if risk ≥ `BLOCK_THRESHOLD`, otherwise `review` if risk ≥
   `REVIEW_THRESHOLD`, otherwise `approve`. Thresholds come from `.env`; the service
-  logs a warning at startup if they differ from the ones stored with the model.
+  logs a warning at startup if they differ from the ones stored with the model. A
+  velocity rule can then turn `approve` into `review`; `model_decision` keeps what
+  the model said and `reasons` lists the rules that changed it.
 - **422:** a missing, misspelled or extra field, text, NaN, infinity, a negative
   `Time` or `Amount`, or a bad batch. The body lists each bad field's location and
   the reason, without echoing the values sent. A batch is all or nothing.
@@ -323,12 +444,16 @@ python -m scripts.consume --group candidate-model      # replay the topic separa
    plain `def`, so CPU work runs in a worker thread instead of blocking the server.
 7. **Decision store** (`src/storage/`). One row per transaction in a `decisions`
    table, keyed by `transaction_id`: risk score, decision, both thresholds, model
-   version and `scored_at` in UTC. The features are not stored. A batch is saved
+   version, `scored_at` in UTC, and from Phase 5 the card, the velocity counts, the
+   model's own decision and the rules that changed it. The transaction's own
+   features are not stored. A batch is saved
    with one `INSERT ... ON CONFLICT DO UPDATE`, so replaying a transaction, as
    Kafka's at-least-once delivery will in Phase 4, updates its row instead of
    duplicating it. Check constraints keep decisions and scores valid in the
-   database itself. The schema is created on first use; there are no migrations
-   yet.
+   database itself. The schema is created on first use, and missing **nullable**
+   columns are added to a table that already holds rows — which is how Phase 5's
+   columns reached 56,746 existing decisions. Anything else (a type change, a NOT
+   NULL column, a drop) is refused and needs a migration tool such as Alembic.
 8. **Container** (`Dockerfile`, `docker-compose.yml`). A two-stage image on
    `python:3.10-slim` running as a non-root user, with the model copied in, so an
    image tag identifies exactly one model. It installs `requirements-api.txt`,
@@ -350,6 +475,19 @@ python -m scripts.consume --group candidate-model      # replay the topic separa
     session stays alive. The consumer runs the API's image with a different command;
     the producer has its own build target, which adds a parquet reader the API does
     not need.
+11. **Velocity** (`src/features/`, `docker-compose.yml`). Redis 8 with persistence
+    off, a memory ceiling and `allkeys-lru`, because everything in it is derived from
+    transactions Kafka still holds. `velocity.py` keeps one sorted set per card and
+    measures a whole batch in one pipeline; `entities.py` invents the card, merchant
+    and country by hashing the transaction id. The client is synchronous, like the
+    decision store, and the consumer calls both from a worker thread, so there is one
+    implementation rather than a sync and an async copy of every query.
+12. **Rules** (`src/features/rules.py`). Run after the model, on the measured
+    features. They escalate `approve` to `review`, never block and never soften, and
+    each rule that fires is named in the response and the row. Thresholds are set
+    from plausible cardholder behaviour and then checked against analyst capacity,
+    never fitted to the fraud labels: the card ids are synthetic, so fitting them to
+    labels would fit noise.
 
 ## Layout
 
@@ -379,11 +517,15 @@ python -m scripts.consume --group candidate-model      # replay the topic separa
 | `src/streaming/producer.py`, `scripts/produce.py` | streams the test set into Kafka |
 | `src/streaming/consumer.py`, `scripts/consume.py` | scores the stream and records the decisions |
 | `scripts/check_kafka.py` | checks that Kafka answers and the topics exist |
+| `src/features/entities.py` | the synthetic card, merchant and country |
+| `src/features/redis_client.py` | the Redis connection: fails fast, never retries ten times |
+| `src/features/velocity.py` | the velocity store: sorted sets, windows, the retry window |
+| `src/features/rules.py` | the velocity rules and what each one means |
+| `scripts/check_redis.py` | checks that Redis answers and shows what it holds |
 | `Dockerfile`, `requirements-api.txt`, `requirements-producer.txt`, `.dockerignore` | the API/consumer and producer images and their pinned libraries |
-| `docker-compose.yml` | the pipeline: API, consumer, Postgres, Kafka, and the producer on demand |
-| `src/features/` | Phase 5 (not built yet) |
+| `docker-compose.yml` | the pipeline: API, consumer, Postgres, Kafka, Redis, and the producer on demand |
 | `notebooks/` | one notebook per step, each ending in a findings cell; nothing imports from here |
-| `tests/` | 297 tests; run with `pytest`. Storage tests run on SQLite and, with `docker compose up`, on real Postgres too (`pytest -m postgres`). Kafka tests (`pytest -m kafka`) use throwaway topics on the Compose broker. Without the services running, those tests are skipped |
+| `tests/` | 399 tests; run with `pytest`. Storage tests run on SQLite and, with `docker compose up`, on real Postgres too (`pytest -m postgres`). Kafka tests (`pytest -m kafka`) use throwaway topics on the Compose broker, and Redis tests (`pytest -m redis`) a database of their own. Without the services running, those tests are skipped |
 
 Notebooks: `001_explore` · `002_preprocess` · `003_isolation_forest` · `004_risk_score` ·
 `005_evaluation` · `006_thresholds` · `007_xgboost_baseline` · `008_xgboost_thresholds` ·
@@ -402,8 +544,12 @@ of the imbalance, models are judged on **PR-AUC and precision/recall**, never ac
   and test, which favours a supervised model. The dataset cannot show how XGBoost
   degrades when fraudsters change tactics, or handle labels arriving weeks late
   through chargebacks. Those are the situations anomaly detection exists for.
-- **Anonymised features.** `V1`–`V28` cannot be interpreted or extended. Phase 5 adds
-  velocity features using synthetic transactions with real fields.
+- **Anonymised features, and invented identities.** `V1`–`V28` cannot be interpreted
+  or extended, and no card, merchant or country survived the PCA. The velocity
+  features therefore run on synthetic identities, which are deliberately independent
+  of the fraud label: Phase 5 can show what the rules cost, and **cannot show that
+  they catch more fraud**. On real identities that is exactly what they would be
+  judged on.
 - **Small fraud counts.** 95 test fraud cases means wide confidence intervals; treat
   differences of a few percentage points as noise.
 - **Thresholds belong to one model.** The probability scale shifts between retrains,
@@ -423,5 +569,14 @@ of the imbalance, models are judged on **PR-AUC and precision/recall**, never ac
 - **The consumer reports no health.** Compose switches off its health check because
   it serves no HTTP endpoint; consumer lag is only in its logs until Phase 6 exports
   metrics.
-- **No schema migrations.** The table is created if it is missing but never
-  altered. Changing a column needs a migration tool such as Alembic.
+- **Velocity depends on how fast the stream runs.** The rules measure arrival time,
+  and the producer compresses two days into minutes, so a fast replay makes every
+  card look frantic (14.5% escalated at 100/s against 0.79% at the data's own pace).
+  Thresholds for a real deployment have to be set against real traffic.
+- **Redis keeps nothing.** It runs without persistence, so a restart empties every
+  card's history and the first transactions afterwards look like a card's first.
+  Nothing is lost that matters — decisions are in Postgres, transactions in Kafka —
+  but the features are briefly wrong, and there is one Redis, not a replicated pair.
+- **Only additive schema changes.** Missing nullable columns are added automatically;
+  a type change, a NOT NULL column or a drop is refused and needs a migration tool
+  such as Alembic.
