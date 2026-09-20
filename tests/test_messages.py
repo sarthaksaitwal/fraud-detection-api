@@ -9,6 +9,7 @@ import pytest
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 from src.api.schemas import Transaction
+from src.features.entities import entities_for
 from src.ml.preprocess import RAW_FEATURES
 from src.streaming.messages import (
     FAILED_AT_HEADER,
@@ -61,8 +62,24 @@ def test_the_key_is_the_transaction_id(transaction):
 
 def test_the_value_is_the_body_post_score_accepts(transaction):
     value = json.loads(encode_transaction(transaction).value)
-    assert list(value) == ["transaction_id", *RAW_FEATURES]
+    assert list(value) == ["transaction_id", *RAW_FEATURES, "card_id", "merchant", "country"]
     assert Transaction(**value) == transaction
+
+
+def test_the_card_merchant_and_country_survive_the_round_trip(raw_df):
+    """Step 5.2: what velocity counts per has to reach the consumer."""
+    transaction = Transaction(
+        transaction_id="tx-1",
+        **entities_for("tx-1"),
+        **raw_df[RAW_FEATURES].iloc[0].to_dict(),
+    )
+    record = encode_transaction(transaction)
+    decoded = decode_transaction(record.key, record.value)
+    assert (decoded.card_id, decoded.merchant, decoded.country) == (
+        transaction.card_id,
+        transaction.merchant,
+        transaction.country,
+    )
 
 
 def test_a_message_without_a_key_is_accepted(transaction):

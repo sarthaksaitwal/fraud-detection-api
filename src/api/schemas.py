@@ -20,6 +20,10 @@ from src.ml.preprocess import RAW_FEATURES
 
 MAX_BATCH_SIZE = 1000
 
+# Card ids, merchants and countries: letters, digits and a few separators, up to
+# 64 characters. Anything else is a mistake, and these strings become key names.
+ENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
+
 
 def new_transaction_id() -> str:
     return uuid4().hex
@@ -74,6 +78,19 @@ class Transaction(BaseModel):
     V27: float
     V28: float
     Amount: float = Field(ge=0, description="transaction amount")
+
+    # ------------------------------------------------ who and where (Phase 5)
+    # Optional: the dataset's own columns are still a complete request, and a
+    # transaction without a card simply gets no velocity features. The pattern
+    # keeps these short and printable, because card_id becomes part of a Redis
+    # key and all three end up in logs.
+    card_id: str | None = Field(
+        None, pattern=ENTITY_PATTERN, description="the card this transaction was made with"
+    )
+    merchant: str | None = Field(None, pattern=ENTITY_PATTERN, description="where it was spent")
+    country: str | None = Field(
+        None, pattern=r"^[A-Z]{2}$", description="ISO 3166-1 alpha-2 country code"
+    )
 
     def features(self) -> dict[str, float]:
         """The model inputs, in the column order the model was trained on."""

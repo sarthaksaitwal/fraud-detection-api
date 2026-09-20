@@ -3,7 +3,9 @@
 Transactions go out in the order they happened (by `Time`), keyed by
 transaction_id, at a steady rate. Their ids are `test-row-<row>`, the same ids
 scripts/sample_request.py uses, so a streamed transaction can be looked up with
-GET /transactions/test-row-<row> once the consumer has scored it.
+GET /transactions/test-row-<row> once the consumer has scored it. Each one also
+carries a synthetic card, merchant and country (src/features/entities.py), which
+is what Phase 5 counts recent activity per.
 
 Delivery guarantees:
   acks="all"                 Kafka confirms each message only once it is stored
@@ -26,6 +28,7 @@ from aiokafka import AIOKafkaProducer
 
 from src.api.schemas import Transaction
 from src.config import settings
+from src.features.entities import entities_for
 from src.ml.preprocess import RAW_FEATURES
 from src.streaming.kafka import check_topics
 from src.streaming.messages import encode_transaction
@@ -48,10 +51,16 @@ def load_transactions(
     if start >= len(ordered):
         raise ValueError(f"--start {start} is past the end: the test set has {len(ordered)} rows")
     chosen = ordered.iloc[start : None if limit is None else start + limit]
-    return [
-        Transaction(transaction_id=f"test-row-{row}", **values)
-        for row, values in zip(chosen.index, chosen[RAW_FEATURES].to_dict("records"), strict=True)
-    ]
+    rows = zip(chosen.index, chosen[RAW_FEATURES].to_dict("records"), strict=True)
+    transactions = []
+    for row, values in rows:
+        # The card, merchant and country are invented, and follow from the id:
+        # resuming with --start gives a transaction the same card as last time.
+        transaction_id = f"test-row-{row}"
+        transactions.append(
+            Transaction(transaction_id=transaction_id, **entities_for(transaction_id), **values)
+        )
+    return transactions
 
 
 @dataclass

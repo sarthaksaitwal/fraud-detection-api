@@ -9,6 +9,7 @@ from aiokafka.errors import KafkaError
 
 from scripts import produce as produce_script
 from src.api.schemas import Transaction
+from src.features.entities import entities_for
 from src.ml.preprocess import RAW_FEATURES
 from src.streaming.kafka import MissingTopicsError
 from src.streaming.messages import decode_transaction
@@ -170,6 +171,26 @@ def test_equal_times_keep_a_stable_order(test_split, tmp_path):
     assert [t.transaction_id for t in load_transactions(path=path)] == [
         f"test-row-{row}" for row in sorted(tied.index)
     ]
+
+
+def test_every_transaction_carries_a_card_merchant_and_country(test_split):
+    """Step 5.2: the stream has to say whose card it is for velocity to count anything."""
+    path, _ = test_split
+    loaded = load_transactions(path=path)
+    assert all(t.card_id and t.merchant and t.country for t in loaded)
+    assert loaded[0].card_id == entities_for(loaded[0].transaction_id)["card_id"]
+    # Far fewer cards than transactions, which is what makes a card busy.
+    assert len({t.card_id for t in loaded}) < len(loaded)
+
+
+def test_resuming_gives_a_transaction_the_same_card_as_before(test_split):
+    """A message redelivered, or re-sent after --start, must not change identity."""
+    path, _ = test_split
+    first_run = {t.transaction_id: t.card_id for t in load_transactions(path=path)}
+    resumed = load_transactions(start=10, limit=5, path=path)
+    assert {t.transaction_id: t.card_id for t in resumed} == {
+        t.transaction_id: first_run[t.transaction_id] for t in resumed
+    }
 
 
 def test_a_start_past_the_end_is_an_error(test_split):

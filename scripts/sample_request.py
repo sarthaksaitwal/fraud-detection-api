@@ -24,6 +24,7 @@ import pandas as pd
 
 from src.api.schemas import MAX_BATCH_SIZE, Decision
 from src.config import settings
+from src.features.entities import entities_for
 from src.ml.model import fraud_probability
 from src.ml.preprocess import RAW_FEATURES, TARGET
 from src.scoring import Scorer, decide
@@ -43,11 +44,18 @@ def select_rows(
 
 
 def request_body(rows: pd.DataFrame, batch: bool) -> dict[str, Any]:
-    """A /score body for one row, or a /score/batch body for several."""
-    transactions = [
-        {"transaction_id": f"test-row-{index}", **values}
-        for index, values in zip(rows.index, rows.to_dict(orient="records"), strict=True)
-    ]
+    """A /score body for one row, or a /score/batch body for several.
+
+    Each body carries the same synthetic card, merchant and country the producer
+    puts on the stream (Step 5.2), so a sample request exercises the velocity
+    features rather than arriving as an unknown card.
+    """
+    transactions = []
+    for index, values in zip(rows.index, rows.to_dict(orient="records"), strict=True):
+        transaction_id = f"test-row-{index}"
+        transactions.append(
+            {"transaction_id": transaction_id, **entities_for(transaction_id), **values}
+        )
     return {"transactions": transactions} if batch else transactions[0]
 
 

@@ -14,6 +14,9 @@ from src.api.schemas import (
 )
 from src.ml.preprocess import RAW_FEATURES
 
+# Who the transaction belongs to (Phase 5), as opposed to what the model scores.
+IDENTITY = ("card_id", "merchant", "country")
+
 
 @pytest.fixture
 def payload(raw_df):
@@ -28,7 +31,36 @@ def test_a_dataset_row_is_a_valid_transaction(payload):
 
 
 def test_transaction_fields_match_the_model_inputs():
-    assert [name for name in Transaction.model_fields if name != "transaction_id"] == RAW_FEATURES
+    """Everything but the id and the Phase 5 identity fields is a model input."""
+    assert [
+        name for name in Transaction.model_fields if name not in {"transaction_id", *IDENTITY}
+    ] == RAW_FEATURES
+
+
+def test_the_identity_fields_are_optional_and_not_model_inputs(payload):
+    """Step 5.2: who the card is never reaches the model, which was trained without it."""
+    plain = Transaction(**payload)
+    identified = Transaction(**payload, card_id="card-00001", merchant="airline", country="GB")
+    assert (plain.card_id, plain.merchant, plain.country) == (None, None, None)
+    assert identified.features() == plain.features()
+    assert "card_id" not in identified.features()
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("card_id", "card 1"),  # a space
+        ("card_id", "-card"),  # does not start with a letter or digit
+        ("card_id", "c" * 65),  # longer than the limit
+        ("merchant", "shop//name"),
+        ("country", "gb"),  # lower case
+        ("country", "GBR"),  # three letters
+    ],
+)
+def test_an_unusable_identity_is_a_validation_error(payload, field, value):
+    """These end up in Redis key names and in logs, so they stay short and printable."""
+    with pytest.raises(ValidationError):
+        Transaction(**payload, **{field: value})
 
 
 def test_transaction_id_is_generated_when_omitted(payload):

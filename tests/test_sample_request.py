@@ -7,6 +7,7 @@ import pytest
 
 from scripts import sample_request
 from src.api.schemas import Decision, Transaction, TransactionBatch
+from src.features.entities import entities_for
 from src.ml.preprocess import RAW_FEATURES, TARGET
 from src.scoring import Scorer
 
@@ -33,6 +34,14 @@ def X(raw_df):
 def test_selects_rows_with_the_requested_decision(X):
     rows = sample_request.select_rows(X, SCORER, Decision.BLOCK, n=2)
     assert list(rows.index) == [3, 6]
+
+
+def test_the_body_carries_the_same_identity_the_stream_uses(X):
+    """Step 5.2: a sample request looks like a real card's transaction, not an unknown one."""
+    body = sample_request.request_body(X.head(1), batch=False)
+    assert {"card_id", "merchant", "country"} <= body.keys()
+    assert body["card_id"] == entities_for(body["transaction_id"])["card_id"]
+    assert Transaction(**body).card_id == body["card_id"]
 
 
 def test_without_a_decision_takes_the_first_rows(X):
