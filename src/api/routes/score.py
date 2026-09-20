@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends
 from src.api.dependencies import get_scorer, get_store, get_velocity
 from src.api.schemas import BatchResult, RiskResult, Transaction, TransactionBatch, VelocityFeatures
 from src.features.velocity import VelocityStore
+from src.observability.metrics import record_results
 from src.scoring import Scorer
 from src.storage.store import DecisionStore
 
@@ -40,6 +41,7 @@ def score(
     # and recording it in Redis is part of measuring it.
     (features,) = measure(velocity, [transaction])
     result = scorer.score_one(transaction, features)
+    record_results([result], source="api")
     if store is not None:
         store.record([result])
     return result
@@ -57,6 +59,7 @@ def score_batch(
     All or nothing: if any transaction is invalid, the whole batch is a 422.
     """
     results = scorer.score(batch.transactions, measure(velocity, batch.transactions))
+    record_results(results, source="api")
     if store is not None:
         store.record(results)
     return BatchResult(results=results)

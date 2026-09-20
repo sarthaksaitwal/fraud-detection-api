@@ -53,10 +53,10 @@ def test_model_libraries_match_the_training_environment():
     assert pinned == installed
 
 
-def test_the_database_driver_and_the_kafka_and_redis_clients_are_installed():
+def test_the_clients_the_service_needs_at_runtime_are_installed():
     # SQLAlchemy only imports the driver when it first connects, so a missing one
     # would not show up until the container was already running.
-    assert {"psycopg", "aiokafka", "redis"} <= pins().keys()
+    assert {"psycopg", "aiokafka", "redis", "prometheus-client"} <= pins().keys()
 
 
 def test_the_producer_image_has_everything_the_service_image_has_plus_parquet():

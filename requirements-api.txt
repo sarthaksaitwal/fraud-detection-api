@@ -26,3 +26,6 @@ aiokafka==0.14.0
 
 # --- velocity features
 redis==8.1.0
+
+# --- metrics
+prometheus-client==0.26.0

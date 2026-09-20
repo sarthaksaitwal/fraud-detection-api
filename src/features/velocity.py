@@ -43,6 +43,11 @@ from redis.client import Pipeline
 from redis.exceptions import RedisError
 
 from src.api.schemas import Transaction, VelocityFeatures
+from src.observability.metrics import (
+    velocity_duration_seconds,
+    velocity_failures_total,
+    velocity_skipped_total,
+)
 
 log = logging.getLogger("src.features.velocity")
 
@@ -212,12 +217,18 @@ class VelocityStore:
         if self.is_resting():
             with self._lock:
                 self._skipped += len(transactions)
+            velocity_failures_total.labels(reason="resting").inc()
+            velocity_skipped_total.inc(len(transactions))
             return [None] * len(transactions)
+        started = time.perf_counter()
         try:
             features = self.measure(transactions)
         except RedisError as exc:
             self._failed(exc, len(transactions))
+            velocity_failures_total.labels(reason=type(exc).__name__).inc()
+            velocity_skipped_total.inc(len(transactions))
             return [None] * len(transactions)
+        velocity_duration_seconds.observe(time.perf_counter() - started)
         self._recovered()
         return features
 
