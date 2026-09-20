@@ -1,4 +1,4 @@
-# The whole pipeline: API, consumer, Postgres and Kafka (Steps 3.4, 4.1, 4.6).
+# The whole pipeline: API, consumer, Postgres, Kafka and Redis (Steps 3.4, 4.1, 4.6, 5.1).
 #
 #   docker compose up -d --build                        # or: make up
 #   docker compose run --rm producer --limit 1000       # stream transactions in (make stream)
@@ -7,7 +7,7 @@
 #   docker compose down -v                              # also deletes the database and Kafka volumes
 #
 # Values like ${POSTGRES_PORT:-5433} come from .env in this folder if set there,
-# otherwise the default after ":-". Phase 5 adds Redis here.
+# otherwise the default after ":-".
 
 name: fraud-detection
 
@@ -18,6 +18,8 @@ x-scoring-environment: &scoring-environment
   # Inside the Compose network services are reached by their service names.
   DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-fraud}:${POSTGRES_PASSWORD:-fraud}@postgres:5432/${POSTGRES_DB:-fraud}
   PERSIST_DECISIONS: "true"
+  REDIS_URL: redis://redis:6379/0
+  VELOCITY_FEATURES: ${VELOCITY_FEATURES:-true}
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
   REVIEW_THRESHOLD: ${REVIEW_THRESHOLD:-0.24}
   BLOCK_THRESHOLD: ${BLOCK_THRESHOLD:-0.95}
@@ -46,6 +48,36 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  redis:
+    # Recent activity per card, for velocity features (Phase 5). Everything in
+    # here is derived from transactions Kafka still holds, so:
+    #   --save "" --appendonly no  nothing is written to disk; a restart starts empty
+    #   --maxmemory / allkeys-lru  a memory limit it cannot grow past. If velocity
+    #                              keys ever outgrow it, Redis drops the least
+    #                              recently used ones instead of the server dying.
+    image: redis:8-alpine
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      # 127.0.0.1 only. Redis has no password here, so it must not be reachable
+      # from the network: anything that connects can read and delete everything.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
   api:
     build:
       context: .
@@ -55,6 +87,8 @@ services:
       postgres:
         # Wait until Postgres accepts connections, not merely until its container
         # has started. The API would recover without this, but would log a warning.
+        condition: service_healthy
+      redis:
         condition: service_healthy
     environment:
       <<: *scoring-environment
@@ -144,6 +178,8 @@ services:
     command: ["python", "-m", "scripts.consume"]
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully

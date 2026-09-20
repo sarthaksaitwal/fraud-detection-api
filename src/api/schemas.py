@@ -130,3 +130,6 @@ class HealthResponse(BaseModel):
     decision_store: Literal["ok", "unavailable", "disabled"] = Field(
         description="unavailable: scoring still works, but decisions are not being recorded"
     )
+    velocity: Literal["ok", "unavailable", "disabled"] = Field(
+        description="unavailable: scoring still works, but without recent-activity features"
+    )

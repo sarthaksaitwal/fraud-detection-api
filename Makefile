@@ -58,11 +58,20 @@ check-kafka:  ## check Kafka answers and the topics exist
 test-kafka:  ## run only the tests that need Kafka (make kafka first)
 	$(PY) -m pytest -m kafka -rs
 
+redis:    ## start Redis, where recent card activity lives  (Phase 5)
+	docker compose up -d redis
+
+check-redis:  ## check Redis answers and show what it holds
+	$(PY) -m scripts.check_redis
+
+test-redis:  ## run only the tests that need Redis (make redis first)
+	$(PY) -m pytest -m redis -rs
+
 produce:  ## stream the test set into Kafka at PRODUCER_RATE_PER_SEC
 	$(PY) -m scripts.produce
 
 consume:  ## score transactions from Kafka into Postgres (Ctrl+C to stop)
 	$(PY) -m scripts.consume
 
-.PHONY: help install data train api test lint fmt image up down logs psql init-db test-postgres kafka check-kafka test-kafka produce consume stream
+.PHONY: help install data train api test lint fmt image up down logs psql init-db test-postgres kafka check-kafka test-kafka redis check-redis test-redis produce consume stream
 

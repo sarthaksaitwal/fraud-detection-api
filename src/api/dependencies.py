@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request
+from redis import Redis
 
 from src.scoring import Scorer
 from src.storage.store import DecisionStore
@@ -18,6 +19,11 @@ def get_scorer(request: Request) -> Scorer:
 def get_store(request: Request) -> DecisionStore | None:
     """The decision store opened at startup, or None when recording is switched off."""
     return request.app.state.store
+
+
+def get_redis(request: Request) -> Redis | None:
+    """The Redis client opened at startup, or None when velocity features are off."""
+    return request.app.state.redis
 
 
 def require_store(store: Annotated[DecisionStore | None, Depends(get_store)]) -> DecisionStore:

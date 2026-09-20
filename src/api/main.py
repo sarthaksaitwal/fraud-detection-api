@@ -26,10 +26,12 @@ from uuid import uuid4
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from redis import Redis
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.routes import health, score, transactions
 from src.config import settings
+from src.features.redis_client import open_configured_redis
 from src.scoring import Scorer
 from src.storage.store import DecisionStore, StoreUnavailableError, open_configured_store
 
@@ -92,6 +94,7 @@ async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResp
 def create_app(
     load_scorer: Callable[[], Scorer] = Scorer.load,
     open_store: Callable[[], DecisionStore | None] = open_configured_store,
+    open_redis: Callable[[], Redis | None] = open_configured_redis,
 ) -> FastAPI:
     """Build the app. Tests pass their own loaders to avoid the real model and database."""
 
@@ -102,11 +105,14 @@ def create_app(
         )
         app.state.scorer = load_scorer()
         app.state.store = open_store()
+        app.state.redis = open_redis()
         try:
             yield
         finally:
             if app.state.store is not None:
                 app.state.store.close()
+            if app.state.redis is not None:
+                app.state.redis.close()
 
     app = FastAPI(
         title=settings.app_name,

@@ -23,3 +23,6 @@ psycopg[binary]==3.3.5
 
 # --- the Kafka consumer
 aiokafka==0.14.0
+
+# --- velocity features
+redis==8.1.0

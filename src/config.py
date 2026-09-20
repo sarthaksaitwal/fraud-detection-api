@@ -81,7 +81,14 @@ class Settings(BaseSettings):
     consumer_max_batch: int = Field(500, ge=1, le=10_000)
 
     # ------------------------------------------------------- redis (Phase 5)
-    redis_url: str = "redis://localhost:6379/0"
+    # 127.0.0.1, not localhost, for the same IPv6 reason as DATABASE_URL.
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    # Compute velocity features. false: score on the transaction alone.
+    velocity_features: bool = True
+    # Redis is read and written in front of every score, so it must fail fast
+    # rather than hold the request. A local Redis answers in well under a
+    # millisecond; anything near this limit means it is in trouble.
+    redis_timeout_seconds: float = Field(0.25, gt=0)
 
     # ----------------------------------------------------------------------
     # Derived paths. Properties, not fields, so they are never read from env.

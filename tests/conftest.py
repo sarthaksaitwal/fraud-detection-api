@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import numpy as np
@@ -9,10 +10,12 @@ import pandas as pd
 import pytest
 from aiokafka.admin import NewTopic
 from aiokafka.errors import KafkaError
+from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.config import settings
+from src.features.redis_client import create_redis
 from src.ml.preprocess import TARGET, V_COLUMNS
 from src.storage.db import create_db_engine
 from src.storage.store import failure_reason
@@ -21,11 +24,20 @@ from src.streaming.kafka import MissingTopicsError, admin_client, partition_coun
 # The columns that separate fraud most strongly in the real data (Step 1.1, Cell 9).
 FRAUD_SIGNAL_COLUMNS = ["V3", "V10", "V12", "V14", "V17"]
 
+# Redis database for tests, so they never touch database 0's velocity keys.
+TEST_REDIS_DB = 15
+
 
 @pytest.fixture(autouse=True)
 def no_configured_database(monkeypatch):
     """No test writes to the database in .env. Tests that need one open their own."""
     monkeypatch.setattr(settings, "persist_decisions", False)
+
+
+@pytest.fixture(autouse=True)
+def no_configured_redis(monkeypatch):
+    """No test touches the Redis in .env. Tests that need one open their own."""
+    monkeypatch.setattr(settings, "velocity_features", False)
 
 
 @pytest.fixture(scope="session")
@@ -123,6 +135,38 @@ def make_topic(kafka_bootstrap):
 def throwaway_topic(make_topic):
     """A new one-partition topic, deleted after the test."""
     return make_topic()
+
+
+@pytest.fixture(scope="session")
+def redis_url():
+    """A Redis URL on a database of its own, or a skip if no server answers.
+
+    Uses TEST_REDIS_URL, else REDIS_URL with logical database 15 instead of 0:
+    tests empty the database they use, and must never empty the one the service
+    is filling with velocity keys.
+    """
+    url = os.environ.get("TEST_REDIS_URL")
+    if not url:
+        url = urlunsplit(urlsplit(settings.redis_url)._replace(path=f"/{TEST_REDIS_DB}"))
+
+    client = create_redis(url)
+    try:
+        client.ping()
+    except RedisError as exc:
+        pytest.skip(f"no Redis answering at {url}: {type(exc).__name__}")
+    finally:
+        client.close()
+    return url
+
+
+@pytest.fixture
+def redis_client(redis_url):
+    """An empty Redis database for one test, emptied again afterwards."""
+    client = create_redis(redis_url)
+    client.flushdb()
+    yield client
+    client.flushdb()
+    client.close()
 
 
 @pytest.fixture

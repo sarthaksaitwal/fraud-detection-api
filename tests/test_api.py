@@ -11,10 +11,14 @@ from fastapi.testclient import TestClient
 
 from src.api.main import create_app
 from src.api.schemas import MAX_BATCH_SIZE
+from src.features.redis_client import create_redis
 from src.ml.artifact import save_model
 from src.ml.model import fit_xgboost, fraud_probability
 from src.ml.preprocess import RAW_FEATURES, split
 from src.scoring import Scorer
+
+# Nothing listens on this port, so /health reports velocity unavailable at once.
+UNREACHABLE_REDIS = "redis://127.0.0.1:6399/0"
 
 
 class AmountAsProbability:
@@ -46,7 +50,26 @@ def test_health_reports_the_model_being_served(client):
         "review_threshold": 0.24,
         "block_threshold": 0.95,
         "decision_store": "disabled",
+        "velocity": "disabled",
     }
+
+
+def test_health_reports_velocity_unavailable_when_redis_is_down():
+    """Step 5.1: the service is still healthy; it just has no recent-activity features."""
+    scorer = Scorer(AmountAsProbability(), "v-test", 0.24, 0.95)
+    app = create_app(load_scorer=lambda: scorer, open_redis=lambda: create_redis(UNREACHABLE_REDIS))
+    with TestClient(app) as test_client:
+        body = test_client.get("/health").json()
+    assert body["status"] == "ok"
+    assert body["velocity"] == "unavailable"
+
+
+@pytest.mark.redis
+def test_health_reports_velocity_ok_with_a_running_redis(redis_url):
+    scorer = Scorer(AmountAsProbability(), "v-test", 0.24, 0.95)
+    app = create_app(load_scorer=lambda: scorer, open_redis=lambda: create_redis(redis_url))
+    with TestClient(app) as test_client:
+        assert test_client.get("/health").json()["velocity"] == "ok"
 
 
 @pytest.mark.parametrize(
