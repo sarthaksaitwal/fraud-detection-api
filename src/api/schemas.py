@@ -97,6 +97,23 @@ class Transaction(BaseModel):
         return {name: getattr(self, name) for name in RAW_FEATURES}
 
 
+class VelocityFeatures(BaseModel):
+    """What the card had done recently when this transaction was scored (Step 5.3).
+
+    Counted in Redis, per card, over the windows in src/features/velocity.py.
+    The transaction being scored is included in the counts.
+    """
+
+    count_1m: int = Field(ge=0, description="transactions on this card in the last minute")
+    count_5m: int = Field(ge=0)
+    count_1h: int = Field(ge=0)
+    amount_1h: float = Field(ge=0, description="total amount on this card in the last hour")
+    countries_1h: int = Field(ge=0, description="distinct countries used in the last hour")
+    seconds_since_previous: float | None = Field(
+        description="gap to this card's previous transaction; null if there was none"
+    )
+
+
 class RiskResult(BaseModel):
     transaction_id: str
     risk_score: float = Field(
