@@ -39,12 +39,25 @@ from typing import Any, Protocol
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.errors import CommitFailedError
+from prometheus_client import start_http_server
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.schemas import Decision, RiskResult, Transaction, VelocityFeatures
 from src.config import settings
 from src.features.redis_client import open_configured_redis
 from src.features.velocity import VelocityStore, open_configured_velocity
+from src.observability.metrics import (
+    batch_duration_seconds,
+    batch_size,
+    consumer_lag,
+    consumer_last_poll_timestamp,
+    consumer_partitions,
+    messages_total,
+    model_loaded,
+    record_results,
+    store_outage_seconds_total,
+    store_outages_total,
+)
 from src.scoring import Scorer
 from src.storage.db import create_db_engine
 from src.storage.store import DecisionStore, failure_reason
@@ -195,6 +208,7 @@ async def record_until_done(
         return True
 
     stats.outages += 1
+    store_outages_total.inc()
     started = clock()
     paused = consumer.assignment()
     consumer.pause(*paused)
@@ -225,7 +239,9 @@ async def record_until_done(
         )
         return False
     finally:
-        stats.seconds_waiting += clock() - started
+        waited = clock() - started
+        stats.seconds_waiting += waited
+        store_outage_seconds_total.inc(waited)
         # A rebalance may have changed the assignment while waiting.
         consumer.resume(*consumer.assignment())
 
@@ -260,8 +276,13 @@ async def handle_batch(
     If stopped during an outage, nothing is committed and the returned stats say
     only how long it waited, with `interrupted` set: the batch will be read again.
     """
+    started = clock()
     messages = [message for partition in batches.values() for message in partition]
     prepared = prepare_batch(messages)
+    batch_size.observe(len(messages))
+    messages_total.labels(outcome="scored").inc(len(prepared.transactions))
+    messages_total.labels(outcome="dead_lettered").inc(len(prepared.dead_letters))
+    messages_total.labels(outcome="duplicate").inc(prepared.duplicates)
     stats = ConsumeStats(
         consumed=len(messages),
         scored=len(prepared.transactions),
@@ -292,6 +313,7 @@ async def handle_batch(
                 outages=stats.outages, seconds_waiting=stats.seconds_waiting, interrupted=True
             )
         stats.decisions.update(result.decision for result in results)
+        record_results(results, source="stream")
 
     try:
         await consumer.commit(offsets_to_commit(batches))
@@ -299,18 +321,31 @@ async def handle_batch(
         # The group rebalanced and these partitions now belong to another consumer,
         # which will read the batch again. Recording is an upsert, so that is safe.
         log.warning("commit failed after a rebalance; the batch will be re-read: %s", error)
+    batch_duration_seconds.observe(clock() - started)
     return stats
 
 
 async def total_lag(consumer: Any) -> int | None:
-    """Messages in the assigned partitions that this consumer has not yet read."""
+    """Messages in the assigned partitions that this consumer has not yet read.
+
+    Also publishes the lag per partition, which is the consumer's real health
+    signal: a partition whose lag only grows is either an undersized consumer or
+    a stuck one. It is an alerting signal, never a restart signal -- lag usually
+    means the producer sped up, and restarting would only make it worse.
+    """
+    assignment = consumer.assignment()
+    consumer_partitions.set(len(assignment))
     total = 0
-    for tp in consumer.assignment():
+    unknown = False
+    for tp in assignment:
         highwater = consumer.highwater(tp)
         if highwater is None:
-            return None
-        total += highwater - await consumer.position(tp)
-    return total
+            unknown = True
+            continue
+        lag = highwater - await consumer.position(tp)
+        consumer_lag.labels(partition=str(tp.partition)).set(lag)
+        total += lag
+    return None if unknown else total
 
 
 async def consume(
@@ -333,6 +368,9 @@ async def consume(
     try:
         while stop is None or not stop.is_set():
             batches = await consumer.getmany(timeout_ms=POLL_TIMEOUT_MS, max_records=max_batch)
+            # Wall-clock, not the loop's monotonic clock: an alert compares it with
+            # its own now() to see whether the consumer has stopped polling.
+            consumer_last_poll_timestamp.set(time.time())
             if any(batches.values()):
                 handled = await handle_batch(
                     batches,
@@ -373,6 +411,7 @@ async def run(
     dlq_topic: str | None = None,
     bootstrap_servers: str | None = None,
     max_batch: int | None = None,
+    metrics_port: int | None = None,
     scorer: Scorer | None = None,
     store: DecisionStore | None = None,
     velocity: VelocityStore | None = None,
@@ -384,9 +423,11 @@ async def run(
     group = group or settings.kafka_consumer_group
     bootstrap_servers = bootstrap_servers or settings.kafka_bootstrap_servers
     max_batch = max_batch or settings.consumer_max_batch
+    metrics_port = settings.consumer_metrics_port if metrics_port is None else metrics_port
 
     await check_topics([topic, dlq_topic], bootstrap_servers)
     scorer = scorer or Scorer.load()
+    model_loaded.labels(model_version=scorer.model_version).set(1)
     owns_store = store is None
     store = store or DecisionStore(create_db_engine())
     try:
@@ -413,6 +454,14 @@ async def run(
     dlq_producer = AIOKafkaProducer(
         bootstrap_servers=bootstrap_servers, acks="all", enable_idempotence=True
     )
+    # A small HTTP server in a daemon thread, serving the same metrics the API
+    # exposes on /metrics. It is also what Compose health-checks, since answering
+    # it proves the process is alive and not wedged.
+    metrics_server = None
+    if metrics_port:
+        metrics_server, _ = start_http_server(metrics_port)
+        log.info("serving metrics on port %d", metrics_port)
+
     await consumer.start()
     await dlq_producer.start()
     log.info("consuming %s as group %s, up to %d per batch", topic, group, max_batch)
@@ -436,3 +485,5 @@ async def run(
             store.close()
         if redis is not None:
             redis.close()
+        if metrics_server is not None:
+            metrics_server.shutdown()

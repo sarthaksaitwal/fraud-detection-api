@@ -190,10 +190,23 @@ services:
       KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-transactions.dlq}
       KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-fraud-scorer}
       CONSUMER_MAX_BATCH: ${CONSUMER_MAX_BATCH:-500}
-    # The image's health check calls the API's /health, which the consumer does not
-    # serve. Consumer lag is the real health signal; Phase 6 exposes it as a metric.
+      CONSUMER_METRICS_PORT: ${CONSUMER_METRICS_PORT:-8001}
+    ports:
+      # Metrics only, on 127.0.0.1: the consumer serves nothing else.
+      - "127.0.0.1:${CONSUMER_METRICS_PORT:-8001}:8001"
+    # Answering a scrape proves the process is alive and its loop is not wedged
+    # (Step 6.2). Lag is deliberately not part of this: lag usually means the
+    # producer sped up, and restarting the consumer would only make it worse.
     healthcheck:
-      disable: true
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/metrics', timeout=5)"
+      interval: 15s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
     # On `docker compose stop` the consumer finishes and commits its current batch.
     # A batch takes well under a second; 30s leaves room for a slow database.
     stop_grace_period: 30s

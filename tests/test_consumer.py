@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.errors import CommitFailedError
+from prometheus_client import REGISTRY
 
 from scripts import consume as consume_script
 from src.api.schemas import Decision, Transaction, VelocityFeatures
@@ -26,6 +27,7 @@ from src.streaming.consumer import (
     prepare_batch,
     record_until_done,
     run,
+    total_lag,
     wait_polling,
 )
 from src.streaming.messages import (
@@ -110,6 +112,7 @@ class FakeConsumer:
         self.commit_error = commit_error
         self.clock = clock or FakeClock()
         self.paused = set()
+        self.highwaters, self.positions = {}, {}
 
     async def getmany(self, timeout_ms=0, max_records=None):
         await asyncio.sleep(0)  # a real poll always hands control back to the event loop
@@ -142,7 +145,11 @@ class FakeConsumer:
         self.seeks.append((tp, offset))
 
     def highwater(self, tp):
-        return None
+        """The offset after the newest message. None until the broker has said."""
+        return self.highwaters.get(tp)
+
+    async def position(self, tp):
+        return self.positions.get(tp, 0)
 
 
 class FakeProducer:
@@ -602,3 +609,85 @@ def test_a_batch_is_still_scored_and_recorded_without_velocity(store, make_trans
     )
     assert (stats.scored, stats.dead_lettered) == (2, 1)
     assert store.get("tx-1").velocity is None
+
+
+# ------------------------------------------------------------ metrics (Step 6.2)
+def metric(name, **labels):
+    return REGISTRY.get_sample_value(name, labels or None) or 0
+
+
+def test_every_message_is_counted_as_what_it_became(store, make_transaction):
+    """Scored, dead-lettered and duplicate are three different problems."""
+    before = {
+        outcome: metric("fraud_consumer_messages_total", outcome=outcome)
+        for outcome in ("scored", "dead_lettered", "duplicate")
+    }
+    batch = batch_of(make_transaction)  # two transactions and one unreadable message
+    asyncio.run(handle_batch(batch, FakeConsumer(), FakeProducer(), "dlq", SCORER, store))
+    assert metric("fraud_consumer_messages_total", outcome="scored") == before["scored"] + 2
+    assert (
+        metric("fraud_consumer_messages_total", outcome="dead_lettered")
+        == before["dead_lettered"] + 1
+    )
+
+
+def test_stream_decisions_are_counted_apart_from_api_ones(store, make_transaction):
+    """One counter, two sources, so a dashboard can show either or both."""
+    before = metric("fraud_decisions_total", decision="block", source="stream")
+    asyncio.run(
+        handle_batch(
+            batch_of(make_transaction), FakeConsumer(), FakeProducer(), "dlq", SCORER, store
+        )
+    )
+    assert metric("fraud_decisions_total", decision="block", source="stream") > before
+
+
+def test_batch_size_and_duration_are_measured(store, make_transaction):
+    # Counted separately: a batch interrupted by an outage is sized but never finished.
+    sizes = metric("fraud_consumer_batch_size_count")
+    durations = metric("fraud_consumer_batch_duration_seconds_count")
+    asyncio.run(
+        handle_batch(
+            batch_of(make_transaction), FakeConsumer(), FakeProducer(), "dlq", SCORER, store
+        )
+    )
+    assert metric("fraud_consumer_batch_size_count") == sizes + 1
+    assert metric("fraud_consumer_batch_duration_seconds_count") == durations + 1
+
+
+def test_a_database_outage_is_counted_in_seconds(store, make_transaction):
+    """So "how long was nothing being recorded?" is a number, not a log search."""
+    outages = metric("fraud_store_outages_total")
+    waited = metric("fraud_store_outage_seconds_total")
+    clock = FakeClock()
+    consumer = FakeConsumer(clock=clock)
+    asyncio.run(
+        handle_batch(
+            batch_of(make_transaction),
+            consumer,
+            FakeProducer(),
+            "dlq",
+            SCORER,
+            FlakyStore(store, failures=2),
+            clock=clock,
+            retry_delays=[5],
+        )
+    )
+    assert metric("fraud_store_outages_total") == outages + 1
+    assert metric("fraud_store_outage_seconds_total") == waited + 10
+
+
+def test_lag_is_published_for_each_partition():
+    """The consumer's real health signal, and the one thing restarting cannot fix."""
+    consumer = FakeConsumer()
+    consumer.highwaters = {TP0: 12, TP1: 4}
+    consumer.positions = {TP0: 7, TP1: 4}
+    assert asyncio.run(total_lag(consumer)) == 5
+    assert metric("fraud_consumer_lag", partition="0") == 5
+    assert metric("fraud_consumer_lag", partition="1") == 0
+    assert metric("fraud_consumer_partitions") == 2
+
+
+def test_lag_is_unknown_until_the_broker_has_answered():
+    """Reporting 0 before the first fetch would look like a consumer that is caught up."""
+    assert asyncio.run(total_lag(FakeConsumer())) is None

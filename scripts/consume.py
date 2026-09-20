@@ -46,11 +46,19 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--topic", default=settings.kafka_topic)
     parser.add_argument("--dlq-topic", default=settings.kafka_dlq_topic)
     parser.add_argument("--bootstrap-servers", default=settings.kafka_bootstrap_servers)
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=settings.consumer_metrics_port,
+        help="serve Prometheus metrics on this port; 0 switches it off",
+    )
     args = parser.parse_args(argv)
     if args.until_idle is not None and args.until_idle <= 0:
         parser.error("--until-idle must be more than 0")
     if args.max_batch < 1:
         parser.error("--max-batch must be at least 1")
+    if not 0 <= args.metrics_port <= 65535:
+        parser.error("--metrics-port must be a port number, or 0 to switch metrics off")
     return args
 
 
@@ -79,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
                 dlq_topic=args.dlq_topic,
                 bootstrap_servers=args.bootstrap_servers,
                 max_batch=args.max_batch,
+                metrics_port=args.metrics_port,
             )
         finally:
             for signum, handler in previous.items():

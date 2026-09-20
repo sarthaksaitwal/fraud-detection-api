@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     producer_rate_per_sec: float = 20.0
     # Messages scored per model call and saved per database write by the consumer.
     consumer_max_batch: int = Field(500, ge=1, le=10_000)
+    # Where the consumer serves its metrics, since it has no web server of its
+    # own (Step 6.2). 0 switches the server off.
+    consumer_metrics_port: int = Field(8001, ge=0, le=65535)
 
     # ------------------------------------------------------- redis (Phase 5)
     # 127.0.0.1, not localhost, for the same IPv6 reason as DATABASE_URL.
