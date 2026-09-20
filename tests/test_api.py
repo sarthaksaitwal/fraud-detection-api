@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from src.api.main import create_app
 from src.api.schemas import MAX_BATCH_SIZE
+from src.config import settings
 from src.features.redis_client import create_redis
 from src.ml.artifact import save_model
 from src.ml.model import fit_xgboost, fraud_probability
@@ -70,6 +71,68 @@ def test_health_reports_velocity_ok_with_a_running_redis(redis_url):
     app = create_app(load_scorer=lambda: scorer, open_redis=lambda: create_redis(redis_url))
     with TestClient(app) as test_client:
         assert test_client.get("/health").json()["velocity"] == "ok"
+
+
+# ------------------------------------------------------- velocity (Step 5.4)
+def test_a_score_has_no_velocity_when_the_feature_is_off(client, payload):
+    body = client.post("/score", json={**payload, "card_id": "card-00001"}).json()
+    assert body["card_id"] == "card-00001"
+    assert body["velocity"] is None
+
+
+@pytest.mark.redis
+def test_a_score_reports_what_the_card_did_recently(redis_url, payload):
+    scorer = Scorer(AmountAsProbability(), "v-test", 0.24, 0.95)
+    app = create_app(load_scorer=lambda: scorer, open_redis=lambda: create_redis(redis_url))
+    with TestClient(app) as client:
+        first = client.post("/score", json={**payload, "card_id": "card-api-1"}).json()
+        second = client.post("/score", json={**payload, "card_id": "card-api-1"}).json()
+    assert first["velocity"]["count_1m"] == 1
+    assert first["velocity"]["seconds_since_previous"] is None
+    # The card has been seen before now, and the gap to it is known.
+    assert second["velocity"]["count_1m"] == 2
+    assert second["velocity"]["seconds_since_previous"] >= 0
+
+
+def test_scoring_carries_on_when_redis_is_down(payload, caplog):
+    """Velocity is a signal, not a gate: losing it must not cost a payment."""
+    scorer = Scorer(AmountAsProbability(), "v-test", 0.24, 0.95)
+    app = create_app(load_scorer=lambda: scorer, open_redis=lambda: create_redis(UNREACHABLE_REDIS))
+    with TestClient(app) as client, caplog.at_level("WARNING"):
+        response = client.post("/score", json={**payload, "Amount": 10, "card_id": "card-00001"})
+    assert response.status_code == 200
+    assert response.json()["decision"] == "approve"
+    assert response.json()["velocity"] is None
+    assert "velocity unavailable" in caplog.text
+
+
+@pytest.mark.redis
+def test_a_batch_measures_every_card_in_one_go(redis_url, batch, redis_client):
+    scorer = Scorer(AmountAsProbability(), "v-test", 0.24, 0.95)
+    app = create_app(load_scorer=lambda: scorer, open_redis=lambda: create_redis(redis_url))
+    batch = [{**row, "card_id": "card-api-3"} for row in batch]
+    with TestClient(app) as client:
+        results = client.post("/score/batch", json={"transactions": batch}).json()["results"]
+    assert [r["velocity"]["count_1m"] for r in results] == [1, 2, 3]
+
+
+@pytest.mark.redis
+def test_a_card_going_too_fast_is_sent_for_review(redis_url, payload, monkeypatch):
+    """Step 5.5: the same transaction, approved at first and reviewed once the card is busy."""
+    monkeypatch.setattr(settings, "velocity_max_per_minute", 2)
+    monkeypatch.setattr(settings, "velocity_min_gap_seconds", 0)  # only the count rule
+    scorer = Scorer(AmountAsProbability(), "v-test", 0.24, 0.95)
+    app = create_app(load_scorer=lambda: scorer, open_redis=lambda: create_redis(redis_url))
+    body = {**payload, "Amount": 10, "card_id": "card-fast"}
+    with TestClient(app) as client:
+        decisions = [
+            client.post("/score", json={**body, "transaction_id": f"tx-{i}"}).json()
+            for i in range(3)
+        ]
+    assert [d["decision"] for d in decisions] == ["approve", "approve", "review"]
+    assert decisions[-1]["model_decision"] == "approve"
+    assert decisions[-1]["reasons"] == ["many_in_a_minute"]
+    assert decisions[-1]["risk_score"] == decisions[0]["risk_score"]  # the score is unchanged
 
 
 @pytest.mark.parametrize(

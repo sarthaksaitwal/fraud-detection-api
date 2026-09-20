@@ -123,6 +123,17 @@ class RiskResult(BaseModel):
     review_threshold: float
     block_threshold: float | None = Field(description="null means the service never blocks")
     model_version: str
+    # ------------------------------------------------------ velocity (Phase 5)
+    card_id: str | None = Field(None, description="the card the transaction was made with")
+    velocity: VelocityFeatures | None = Field(
+        None, description="null: no card on the transaction, or Redis was unavailable"
+    )
+    model_decision: Decision | None = Field(
+        None, description="what the model alone decided, before the velocity rules"
+    )
+    reasons: list[str] = Field(
+        default_factory=list, description="velocity rules that sent this for review, if any"
+    )
 
 
 class TransactionBatch(BaseModel):

@@ -9,6 +9,11 @@ transaction gets the same decision whichever way it arrives.
     risk < review_threshold                 -> approve
 
 The rule matches src/ml/thresholds.py, which priced these thresholds.
+
+From Phase 5 an approved transaction can still be sent for review by the
+velocity rules in src/features/rules.py, on what the card has been doing rather
+than on this transaction. The result keeps both answers: `model_decision` is
+what the model said, `decision` is what the service did.
 """
 
 from __future__ import annotations
@@ -22,8 +27,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.api.schemas import Decision, RiskResult, Transaction
+from src.api.schemas import Decision, RiskResult, Transaction, VelocityFeatures
 from src.config import settings
+from src.features.rules import escalate, reasons_for
 from src.ml.artifact import load_model
 from src.ml.model import fraud_probability
 from src.ml.preprocess import RAW_FEATURES
@@ -88,29 +94,49 @@ class Scorer:
         )
         return scorer
 
-    def score(self, transactions: Sequence[Transaction]) -> list[RiskResult]:
-        """Score many transactions with one model call. Results keep the input order."""
+    def score(
+        self,
+        transactions: Sequence[Transaction],
+        velocity: Sequence[VelocityFeatures | None] | None = None,
+    ) -> list[RiskResult]:
+        """Score many transactions with one model call. Results keep the input order.
+
+        velocity: what each card had done recently (Step 5.4), measured before
+        scoring. The model never sees it -- it was trained without it -- but the
+        velocity rules (Step 5.5) can send an approved transaction for review on
+        the strength of it, and the result says so.
+        """
         if not transactions:
             return []
         X = pd.DataFrame([t.features() for t in transactions], columns=RAW_FEATURES)
         risk = fraud_probability(self.pipeline, X).astype(float)
         decisions = decide(risk, self.review_threshold, self.block_threshold)
-        return [
-            RiskResult(
-                transaction_id=transaction.transaction_id,
-                risk_score=score,
-                decision=decision,
-                review_threshold=self.review_threshold,
-                block_threshold=self.block_threshold,
-                model_version=self.model_version,
+        features = [None] * len(transactions) if velocity is None else list(velocity)
+        results = []
+        for transaction, score, decision, measured in zip(
+            transactions, risk.tolist(), decisions, features, strict=True
+        ):
+            reasons = reasons_for(measured)
+            results.append(
+                RiskResult(
+                    transaction_id=transaction.transaction_id,
+                    risk_score=score,
+                    decision=escalate(decision, reasons),
+                    review_threshold=self.review_threshold,
+                    block_threshold=self.block_threshold,
+                    model_version=self.model_version,
+                    card_id=transaction.card_id,
+                    velocity=measured,
+                    model_decision=decision,
+                    reasons=reasons,
+                )
             )
-            for transaction, score, decision in zip(
-                transactions, risk.tolist(), decisions, strict=True
-            )
-        ]
+        return results
 
-    def score_one(self, transaction: Transaction) -> RiskResult:
-        return self.score([transaction])[0]
+    def score_one(
+        self, transaction: Transaction, velocity: VelocityFeatures | None = None
+    ) -> RiskResult:
+        return self.score([transaction], [velocity])[0]
 
 
 def _warn_if_thresholds_differ(

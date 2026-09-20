@@ -5,15 +5,17 @@ For every batch read from the topic:
     1. decode      each message with the API's Transaction schema
     2. dead-letter the ones that fail, with the reason, to KAFKA_DLQ_TOPIC
     3. deduplicate transaction ids (Postgres refuses one id twice in one save)
-    4. score       the batch with one model call      -- src/scoring.py, as /score/batch
-    5. record      the decisions with one INSERT       -- src/storage/store.py, as /score/batch
-    6. commit      the batch's offsets, only now
+    4. measure     what each card has done recently   -- src/features/velocity.py
+    5. score       the batch with one model call      -- src/scoring.py, as /score/batch
+    6. record      the decisions with one INSERT       -- src/storage/store.py, as /score/batch
+    7. commit      the batch's offsets, only now
 
-Committing last makes delivery at-least-once. A crash anywhere before step 6
+Committing last makes delivery at-least-once. A crash anywhere before step 7
 means the batch is read again on restart: nothing is lost, and the repeat is
-harmless because recording is an upsert keyed by transaction_id.
+harmless because recording is an upsert keyed by transaction_id, and a repeated
+velocity measurement re-adds the same member rather than counting it twice.
 
-If the database is down at step 5, the consumer waits instead of dropping the
+If the database is down at step 6, the consumer waits instead of dropping the
 batch or crashing (Step 4.5). It pauses its partitions, so no new messages are
 fetched, and keeps polling Kafka, so the group does not decide it has died and
 hand its partitions to someone else. It retries with growing delays until the
@@ -39,8 +41,10 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.errors import CommitFailedError
 from sqlalchemy.exc import SQLAlchemyError
 
-from src.api.schemas import Decision, RiskResult, Transaction
+from src.api.schemas import Decision, RiskResult, Transaction, VelocityFeatures
 from src.config import settings
+from src.features.redis_client import open_configured_redis
+from src.features.velocity import VelocityStore, open_configured_velocity
 from src.scoring import Scorer
 from src.storage.db import create_db_engine
 from src.storage.store import DecisionStore, failure_reason
@@ -226,6 +230,19 @@ async def record_until_done(
         consumer.resume(*consumer.assignment())
 
 
+async def measure(
+    velocity: VelocityStore | None, transactions: Sequence[Transaction]
+) -> list[VelocityFeatures | None]:
+    """Recent activity per card, in a worker thread: Redis blocks, this loop must not.
+
+    Velocity never fails a batch. Redis being down costs the features, which is
+    exactly the opposite of the database, which the consumer waits for.
+    """
+    if velocity is None:
+        return [None] * len(transactions)
+    return await asyncio.to_thread(velocity.measure_or_none, transactions)
+
+
 async def handle_batch(
     batches: Mapping[TopicPartition, Sequence[Message]],
     consumer: Any,
@@ -233,11 +250,12 @@ async def handle_batch(
     dlq_topic: str,
     scorer: Scorer,
     store: DecisionStore,
+    velocity: VelocityStore | None = None,
     stop: asyncio.Event | None = None,
     clock: Callable[[], float] = time.monotonic,
     retry_delays: Sequence[float] = RETRY_DELAYS_SECONDS,
 ) -> ConsumeStats:
-    """Steps 1-6 for one batch.
+    """Steps 1-7 for one batch.
 
     If stopped during an outage, nothing is committed and the returned stats say
     only how long it waited, with `interrupted` set: the batch will be read again.
@@ -267,7 +285,8 @@ async def handle_batch(
     if prepared.transactions:
         # Scoring is CPU work and recording blocks on the database, so both run in a
         # worker thread; the event loop stays free to keep the Kafka session alive.
-        results = await asyncio.to_thread(scorer.score, prepared.transactions)
+        features = await measure(velocity, prepared.transactions)
+        results = await asyncio.to_thread(scorer.score, prepared.transactions, features)
         if not await record_until_done(results, consumer, store, stats, stop, clock, retry_delays):
             return ConsumeStats(
                 outages=stats.outages, seconds_waiting=stats.seconds_waiting, interrupted=True
@@ -303,6 +322,7 @@ async def consume(
     max_batch: int,
     stop: asyncio.Event | None = None,
     until_idle: float | None = None,
+    velocity: VelocityStore | None = None,
     clock: Callable[[], float] = time.monotonic,
     retry_delays: Sequence[float] = RETRY_DELAYS_SECONDS,
 ) -> ConsumeStats:
@@ -321,6 +341,7 @@ async def consume(
                     dlq_topic,
                     scorer,
                     store,
+                    velocity=velocity,
                     stop=stop,
                     clock=clock,
                     retry_delays=retry_delays,
@@ -354,9 +375,10 @@ async def run(
     max_batch: int | None = None,
     scorer: Scorer | None = None,
     store: DecisionStore | None = None,
+    velocity: VelocityStore | None = None,
     retry_delays: Sequence[float] = RETRY_DELAYS_SECONDS,
 ) -> ConsumeStats:
-    """Load the model, connect to Kafka and Postgres, consume, and always disconnect."""
+    """Load the model, connect to Kafka, Postgres and Redis, consume, and always disconnect."""
     topic = topic or settings.kafka_topic
     dlq_topic = dlq_topic or settings.kafka_dlq_topic
     group = group or settings.kafka_consumer_group
@@ -372,6 +394,13 @@ async def run(
     except SQLAlchemyError as exc:
         # Not fatal: the first batch waits for the database like any later one.
         log.warning("decision store unavailable at startup: %s", failure_reason(exc))
+
+    # Redis is optional in a way Postgres is not: without it, transactions are
+    # scored without velocity features rather than waiting.
+    redis = None
+    if velocity is None:
+        redis = open_configured_redis()
+        velocity = open_configured_velocity(redis)
 
     consumer = AIOKafkaConsumer(
         topic,
@@ -397,6 +426,7 @@ async def run(
             max_batch,
             stop,
             until_idle,
+            velocity=velocity,
             retry_delays=retry_delays,
         )
     finally:
@@ -404,3 +434,5 @@ async def run(
         await consumer.stop()  # leaves the group so partitions are reassigned at once
         if owns_store:
             store.close()
+        if redis is not None:
+            redis.close()

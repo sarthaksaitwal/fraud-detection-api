@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.api.main import create_app
+from src.features.redis_client import create_redis
 from src.ml.preprocess import RAW_FEATURES
 from src.scoring import Scorer
 from src.storage.db import create_db_engine
@@ -154,3 +155,22 @@ def test_the_store_is_closed_when_the_app_shuts_down(tmp_path):
 def test_docs_describe_the_transaction_endpoints(client):
     paths = client.get("/openapi.json").json()["paths"]
     assert {"/transactions", "/transactions/{transaction_id}"} <= paths.keys()
+
+
+@pytest.mark.redis
+def test_a_stored_decision_reads_back_with_its_velocity(tmp_path, transaction, redis_url):
+    """Step 5.4: the row explains the decision, including what the card had just done."""
+    store = sqlite_store(tmp_path / "decisions.db")
+    app = create_app(
+        load_scorer=lambda: SCORER,
+        open_store=lambda: store,
+        open_redis=lambda: create_redis(redis_url),
+    )
+    with TestClient(app) as client:
+        body = {**transaction("tx-velocity", 10), "card_id": "card-read-1"}
+        scored = client.post("/score", json=body).json()
+        stored = client.get("/transactions/tx-velocity").json()
+    store.close()
+    assert stored["card_id"] == "card-read-1"
+    assert stored["velocity"] == scored["velocity"]
+    assert stored["velocity"]["count_1m"] == 1

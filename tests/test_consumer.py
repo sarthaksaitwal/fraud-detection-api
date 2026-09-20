@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections import Counter
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -11,7 +12,7 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.errors import CommitFailedError
 
 from scripts import consume as consume_script
-from src.api.schemas import Decision, Transaction
+from src.api.schemas import Decision, Transaction, VelocityFeatures
 from src.ml.preprocess import RAW_FEATURES
 from src.scoring import Scorer
 from src.storage.db import create_db_engine
@@ -544,3 +545,60 @@ def test_stopping_during_an_outage_commits_nothing_and_a_restart_recovers(stream
     recovered = consume_stream(stream, store, group)
     assert recovered.consumed == stream.sent
     assert len(store.recent(limit=100)) == 30
+
+
+# ----------------------------------------------------------- velocity (Step 5.4)
+class FakeVelocity:
+    """Counts how often each card is measured, as the real store would."""
+
+    def __init__(self, fail=False):
+        self.seen = Counter()
+        self.fail = fail
+        self.batches = 0
+
+    def measure_or_none(self, transactions):
+        self.batches += 1
+        if self.fail:
+            return [None] * len(transactions)
+        features = []
+        for transaction in transactions:
+            self.seen[transaction.card_id] += 1
+            features.append(
+                VelocityFeatures(
+                    count_1m=self.seen[transaction.card_id],
+                    count_5m=self.seen[transaction.card_id],
+                    count_1h=self.seen[transaction.card_id],
+                    amount_1h=transaction.Amount,
+                    countries_1h=1,
+                    seconds_since_previous=None,
+                )
+            )
+        return features
+
+
+def test_the_consumer_measures_velocity_once_per_batch(store, make_transaction):
+    velocity = FakeVelocity()
+    consumer, producer = FakeConsumer(), FakeProducer()
+    batch = {
+        TopicPartition("transactions", 0): [
+            message(make_transaction("tx-1", 10).model_copy(update={"card_id": "card-1"}), 0),
+            message(make_transaction("tx-2", 20).model_copy(update={"card_id": "card-1"}), 1),
+        ]
+    }
+    stats = asyncio.run(
+        handle_batch(batch, consumer, producer, "dlq", SCORER, store, velocity=velocity)
+    )
+    assert stats.scored == 2
+    assert velocity.batches == 1  # one measurement for the whole batch, not one each
+    assert store.get("tx-2").velocity_count_1m == 2
+
+
+def test_a_batch_is_still_scored_and_recorded_without_velocity(store, make_transaction):
+    """Redis down: the stream keeps moving, and the rows say the features were missing."""
+    velocity = FakeVelocity(fail=True)
+    batch = batch_of(make_transaction)  # two transactions and one unreadable message
+    stats = asyncio.run(
+        handle_batch(batch, FakeConsumer(), FakeProducer(), "dlq", SCORER, store, velocity=velocity)
+    )
+    assert (stats.scored, stats.dead_lettered) == (2, 1)
+    assert store.get("tx-1").velocity is None

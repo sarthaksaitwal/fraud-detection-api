@@ -8,12 +8,18 @@ some things Postgres refuses, so the SQLite run alone proves less than it seems.
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.exc import IntegrityError, StatementError
 
-from src.api.schemas import Decision, RiskResult
+from src.api.schemas import Decision, RiskResult, VelocityFeatures
 from src.storage import repository
-from src.storage.db import create_db_engine, create_schema, create_session_factory, session_scope
+from src.storage.db import (
+    add_missing_columns,
+    create_db_engine,
+    create_schema,
+    create_session_factory,
+    session_scope,
+)
 from src.storage.models import Base, DecisionRecord
 from src.storage.repository import (
     count_decisions,
@@ -34,6 +40,11 @@ def result(transaction_id="tx-1", risk=0.5, decision=Decision.REVIEW, **override
         "model_version": "v-test",
     }
     return RiskResult(**(fields | overrides))
+
+
+VELOCITY = VelocityFeatures(
+    count_1m=3, count_5m=7, count_1h=12, amount_1h=250.5, countries_1h=2, seconds_since_previous=4.5
+)
 
 
 @pytest.fixture(params=["sqlite", pytest.param("postgres", marks=pytest.mark.postgres)])
@@ -169,7 +180,9 @@ def test_a_failed_block_writes_nothing(sessions):
 def test_every_risk_result_field_is_persisted(sessions):
     """Adding a field to the API response must not silently stop being recorded."""
     columns = set(DecisionRecord.__table__.columns.keys())
-    assert set(RiskResult.model_fields) <= columns
+    # Velocity is the one field stored flattened: one column per feature (Step 5.4).
+    assert set(RiskResult.model_fields) - {"velocity"} <= columns
+    assert {f"velocity_{name}" for name in VelocityFeatures.model_fields} <= columns
 
 
 def test_decisions_saved_together_share_one_timestamp(sessions, monkeypatch):
@@ -245,3 +258,128 @@ def test_decisions_are_counted_by_kind(sessions):
     with session_scope(sessions) as session:
         counts = count_decisions(session)
     assert counts == {Decision.APPROVE: 1, Decision.REVIEW: 0, Decision.BLOCK: 2}
+
+
+# ----------------------------------------------------------- velocity (Step 5.4)
+def test_velocity_features_are_saved_with_the_decision(sessions):
+    with session_scope(sessions) as session:
+        save_decisions(session, [result(card_id="card-00001", velocity=VELOCITY)])
+    with session_scope(sessions) as session:
+        stored = get_decision(session, "tx-1")
+        assert stored.card_id == "card-00001"
+        assert stored.velocity == VELOCITY
+        assert stored.velocity_count_1m == 3
+        assert stored.velocity_seconds_since_previous == 4.5
+
+
+def test_a_decision_made_without_velocity_stores_none(sessions):
+    """Redis down, or a transaction with no card: the row says so rather than lying."""
+    with session_scope(sessions) as session:
+        save_decisions(session, [result()])
+    with session_scope(sessions) as session:
+        stored = get_decision(session, "tx-1")
+        assert stored.card_id is None
+        assert stored.velocity is None
+
+
+def test_one_save_can_mix_decisions_with_and_without_velocity(sessions):
+    """A single INSERT ... VALUES needs every row to have the same columns."""
+    with session_scope(sessions) as session:
+        save_decisions(
+            session,
+            [result("tx-1", card_id="card-00001", velocity=VELOCITY), result("tx-2")],
+        )
+    with session_scope(sessions) as session:
+        assert get_decision(session, "tx-1").velocity == VELOCITY
+        assert get_decision(session, "tx-2").velocity is None
+
+
+def test_rescoring_replaces_the_velocity_of_the_earlier_decision(sessions):
+    with session_scope(sessions) as session:
+        save_decisions(session, [result(card_id="card-00001", velocity=VELOCITY)])
+    later = VELOCITY.model_copy(update={"count_1m": 9})
+    with session_scope(sessions) as session:
+        save_decisions(session, [result(card_id="card-00001", velocity=later)])
+    with session_scope(sessions) as session:
+        assert get_decision(session, "tx-1").velocity.count_1m == 9
+
+
+def test_columns_added_to_a_table_that_already_holds_rows(engine):
+    """How Phase 5's columns reach a decisions table full of Phase 4 decisions."""
+    velocity_columns = [c.name for c in DecisionRecord.__table__.columns if "velocity" in c.name]
+    create_schema(engine)
+    with engine.begin() as connection:
+        for column in velocity_columns:
+            connection.execute(text(f"ALTER TABLE decisions DROP COLUMN {column}"))
+
+    # A decision recorded by the Phase 4 code, before the columns existed.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO decisions (transaction_id, risk_score, decision, review_threshold,"
+                " block_threshold, model_version, scored_at)"
+                " VALUES ('older-decision', 0.5, 'review', 0.24, 0.95, 'v-test', :scored_at)"
+            ),
+            {"scored_at": datetime(2026, 9, 1, tzinfo=timezone.utc)},
+        )
+
+    assert sorted(add_missing_columns(engine)) == sorted(f"decisions.{c}" for c in velocity_columns)
+    sessions = create_session_factory(engine)
+    with session_scope(sessions) as session:
+        # The old row survived and simply has no velocity.
+        assert get_decision(session, "older-decision").velocity is None
+        save_decisions(session, [result("newer-decision", velocity=VELOCITY)])
+    with session_scope(sessions) as session:
+        assert get_decision(session, "newer-decision").velocity == VELOCITY
+
+
+def test_a_missing_column_that_cannot_be_null_is_refused(engine):
+    """Adding a column with no value for existing rows is a real migration, not this."""
+    create_schema(engine)
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE decisions DROP COLUMN model_version"))
+    with pytest.raises(RuntimeError, match="NOT NULL"):
+        add_missing_columns(engine)
+
+
+def test_the_rules_that_escalated_a_decision_are_stored(sessions):
+    """Step 5.5: a review queue has to say why each transaction is in it."""
+    escalated = result(
+        decision=Decision.REVIEW,
+        model_decision=Decision.APPROVE,
+        reasons=["many_in_a_minute", "back_to_back"],
+        card_id="card-00001",
+        velocity=VELOCITY,
+    )
+    with session_scope(sessions) as session:
+        save_decisions(session, [escalated])
+    with session_scope(sessions) as session:
+        stored = get_decision(session, "tx-1")
+        assert stored.decision == "review"
+        assert stored.model_decision == "approve"
+        assert stored.reasons == ["many_in_a_minute", "back_to_back"]
+
+
+def test_a_decision_the_rules_did_not_touch_stores_an_empty_list(sessions):
+    with session_scope(sessions) as session:
+        save_decisions(
+            session, [result(decision=Decision.APPROVE, model_decision=Decision.APPROVE)]
+        )
+    with session_scope(sessions) as session:
+        assert get_decision(session, "tx-1").reasons == []
+
+
+def test_the_database_refuses_a_model_decision_that_is_not_one(sessions):
+    with pytest.raises(IntegrityError), session_scope(sessions) as session:
+        session.add(
+            DecisionRecord(
+                transaction_id="tx-1",
+                risk_score=0.5,
+                decision="review",
+                review_threshold=0.24,
+                block_threshold=0.95,
+                model_version="v-test",
+                scored_at=datetime(2026, 9, 16, tzinfo=timezone.utc),
+                model_decision="maybe",
+            )
+        )

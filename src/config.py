@@ -90,6 +90,17 @@ class Settings(BaseSettings):
     # millisecond; anything near this limit means it is in trouble.
     redis_timeout_seconds: float = Field(0.25, gt=0)
 
+    # ------------------------------------------- velocity rules (Step 5.5)
+    # Above any of these, an approved transaction is sent for review instead.
+    # Chosen from behaviour, never from the fraud labels: the card ids are
+    # synthetic, so fitting them to the labels would fit noise. They are then
+    # checked against MAX_REVIEW_RATE -- at the test set's own pace they add
+    # about 0.8% of traffic to the review queue, inside the 2% analyst budget.
+    velocity_max_per_minute: int = Field(5, ge=1)
+    velocity_max_per_hour: int = Field(10, ge=1)
+    velocity_max_countries: int = Field(2, ge=1)
+    velocity_min_gap_seconds: float = Field(2.0, ge=0)
+
     # ----------------------------------------------------------------------
     # Derived paths. Properties, not fields, so they are never read from env.
     # ----------------------------------------------------------------------

@@ -32,6 +32,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from src.api.routes import health, score, transactions
 from src.config import settings
 from src.features.redis_client import open_configured_redis
+from src.features.velocity import open_configured_velocity
 from src.scoring import Scorer
 from src.storage.store import DecisionStore, StoreUnavailableError, open_configured_store
 
@@ -106,6 +107,7 @@ def create_app(
         app.state.scorer = load_scorer()
         app.state.store = open_store()
         app.state.redis = open_redis()
+        app.state.velocity = open_configured_velocity(app.state.redis)
         try:
             yield
         finally:

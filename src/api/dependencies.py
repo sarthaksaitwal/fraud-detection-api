@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Request
 from redis import Redis
 
+from src.features.velocity import VelocityStore
 from src.scoring import Scorer
 from src.storage.store import DecisionStore
 
@@ -24,6 +25,11 @@ def get_store(request: Request) -> DecisionStore | None:
 def get_redis(request: Request) -> Redis | None:
     """The Redis client opened at startup, or None when velocity features are off."""
     return request.app.state.redis
+
+
+def get_velocity(request: Request) -> VelocityStore | None:
+    """The velocity store built on the Redis client, or None when it is switched off."""
+    return request.app.state.velocity
 
 
 def require_store(store: Annotated[DecisionStore | None, Depends(get_store)]) -> DecisionStore:

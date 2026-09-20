@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
-from src.api.schemas import Decision, RiskResult
+from src.api.schemas import Decision, RiskResult, VelocityFeatures
 from src.storage.models import DecisionRecord, utcnow
 
 # Both databases speak INSERT ... ON CONFLICT DO UPDATE, but the construct that
@@ -17,6 +17,12 @@ from src.storage.models import DecisionRecord, utcnow
 UPSERT = {"postgresql": postgresql.insert, "sqlite": sqlite.insert}
 
 UPDATABLE = [c.name for c in DecisionRecord.__table__.columns if c.name != "transaction_id"]
+
+
+def velocity_columns(velocity: VelocityFeatures | None) -> dict[str, float | int | None]:
+    """The velocity part of a row: the features flattened, or all None without them."""
+    values = {} if velocity is None else velocity.model_dump()
+    return {f"velocity_{name}": values.get(name) for name in VelocityFeatures.model_fields}
 
 
 def save_decisions(
@@ -45,6 +51,14 @@ def save_decisions(
             "block_threshold": result.block_threshold,
             "model_version": result.model_version,
             "scored_at": scored_at,
+            "card_id": result.card_id,
+            "model_decision": (
+                None if result.model_decision is None else result.model_decision.value
+            ),
+            "reasons": list(result.reasons),
+            # Every row carries the same keys, with None where a decision had no
+            # velocity: one INSERT ... VALUES cannot have rows of different shapes.
+            **velocity_columns(result.velocity),
         }
         for result in results
     ]

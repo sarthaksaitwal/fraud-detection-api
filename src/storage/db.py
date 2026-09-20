@@ -1,16 +1,19 @@
-"""Database engine, sessions and schema creation (Step 3.1)."""
+"""Database engine, sessions and schema creation (Steps 3.1, 5.4)."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.config import settings
 from src.storage.models import Base
+
+log = logging.getLogger("src.storage")
 
 # Scoring waits on the database, so a database that stops answering must fail
 # fast rather than hold every request for the operating system's TCP timeout.
@@ -64,5 +67,41 @@ def session_scope(factory: sessionmaker[Session]) -> Iterator[Session]:
 
 
 def create_schema(engine: Engine) -> None:
-    """Create any missing tables. Safe to repeat; it never alters existing ones."""
+    """Create missing tables, then add missing columns. Safe to repeat.
+
+    Phase 5 adds columns to a `decisions` table that already holds rows, and
+    create_all() only ever creates whole tables. Rather than ask everyone to
+    drop their data, this adds any column the model has and the table does not.
+
+    It is deliberately the smallest possible migration: adding a nullable column
+    cannot fail on existing rows and cannot lose anything. A column that changes
+    type, loses its NULLs or gets dropped needs a migration tool (Alembic), and
+    this will not attempt it.
+    """
     Base.metadata.create_all(engine)
+    add_missing_columns(engine)
+
+
+def add_missing_columns(engine: Engine) -> list[str]:
+    """Add nullable columns the model declares but the table lacks. Returns their names."""
+    inspector = inspect(engine)
+    added = []
+    for table in Base.metadata.sorted_tables:
+        present = {column["name"] for column in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in present:
+                continue
+            if not column.nullable:
+                raise RuntimeError(
+                    f"{table.name}.{column.name} is missing and is NOT NULL; "
+                    f"adding it needs a migration that says what existing rows should hold"
+                )
+            type_sql = column.type.compile(engine.dialect)
+            with engine.begin() as connection:
+                connection.execute(
+                    text(f"ALTER TABLE {table.name} ADD COLUMN {column.name} {type_sql}")
+                )
+            added.append(f"{table.name}.{column.name}")
+    if added:
+        log.info("added missing column(s): %s", ", ".join(added))
+    return added

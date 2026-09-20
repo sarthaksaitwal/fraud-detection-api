@@ -5,7 +5,7 @@ import logging
 import numpy as np
 import pytest
 
-from src.api.schemas import Decision, Transaction
+from src.api.schemas import Decision, Transaction, VelocityFeatures
 from src.ml.artifact import save_model
 from src.ml.model import fit_xgboost, fraud_probability
 from src.ml.preprocess import RAW_FEATURES, split
@@ -113,3 +113,70 @@ def test_load_is_quiet_when_thresholds_match(saved_model, caplog):
     with caplog.at_level(logging.WARNING, logger="src.scoring"):
         Scorer.load(model_path, metadata_path, review_threshold=0.24, block_threshold=0.95)
     assert caplog.text == ""
+
+
+# --------------------------------------------------------- velocity (Step 5.4)
+VELOCITY = VelocityFeatures(
+    count_1m=4, count_5m=6, count_1h=9, amount_1h=90.0, countries_1h=2, seconds_since_previous=1.5
+)
+
+
+def test_velocity_is_carried_into_the_result(transactions):
+    """The model is not given it -- it was trained without it -- but the result explains itself."""
+    scorer = Scorer(FixedProbability([0.1, 0.5, 0.9]), "v-test", 0.24, 0.95)
+    identified = [t.model_copy(update={"card_id": "card-00001"}) for t in transactions]
+    features = [VELOCITY] + [None] * (len(identified) - 1)
+    results = scorer.score(identified, features)
+    assert results[0].velocity == VELOCITY
+    assert results[0].card_id == "card-00001"
+    assert results[1].velocity is None
+
+
+def test_scoring_without_velocity_is_unchanged(transactions):
+    scorer = Scorer(FixedProbability([0.1, 0.5, 0.9]), "v-test", 0.24, 0.95)
+    without = scorer.score(transactions)
+    with_none = scorer.score(transactions, [None] * len(transactions))
+    assert [r.risk_score for r in without] == [r.risk_score for r in with_none]
+    assert all(r.velocity is None for r in without)
+
+
+def test_velocity_must_line_up_with_the_transactions(transactions):
+    """A mismatch would attach one card's history to another card's transaction."""
+    scorer = Scorer(FixedProbability([0.1, 0.5, 0.9]), "v-test", 0.24, 0.95)
+    with pytest.raises(ValueError):
+        scorer.score(transactions, [VELOCITY])
+
+
+# ------------------------------------------------------- the rules (Step 5.5)
+BUSY = VelocityFeatures(
+    count_1m=9, count_5m=9, count_1h=9, amount_1h=90.0, countries_1h=1, seconds_since_previous=30.0
+)
+
+
+def test_a_busy_card_turns_an_approval_into_a_review(transactions):
+    """The model sees one transaction; the rules see what the card has been doing."""
+    scorer = Scorer(FixedProbability([0.01, 0.01, 0.01]), "v-test", 0.24, 0.95)
+    results = scorer.score(transactions, [BUSY, None, None])
+    assert results[0].decision is Decision.REVIEW
+    assert results[0].model_decision is Decision.APPROVE
+    assert results[0].reasons == ["many_in_a_minute"]
+    # The risk score is the model's and is not touched by the rules.
+    assert results[0].risk_score == pytest.approx(0.01)
+    assert results[1].decision is Decision.APPROVE
+    assert results[1].reasons == []
+
+
+def test_the_rules_never_soften_a_block(transactions):
+    scorer = Scorer(FixedProbability([0.99, 0.5, 0.01]), "v-test", 0.24, 0.95)
+    blocked, reviewed, _ = scorer.score(transactions, [BUSY, BUSY, None])
+    assert (blocked.decision, blocked.model_decision) == (Decision.BLOCK, Decision.BLOCK)
+    assert (reviewed.decision, reviewed.model_decision) == (Decision.REVIEW, Decision.REVIEW)
+    # The rules fired; they simply had nothing to add.
+    assert blocked.reasons == ["many_in_a_minute"]
+
+
+def test_without_velocity_the_model_decides_alone(transactions):
+    scorer = Scorer(FixedProbability([0.01, 0.01, 0.01]), "v-test", 0.24, 0.95)
+    result, *_ = scorer.score(transactions)
+    assert result.decision is result.model_decision is Decision.APPROVE
+    assert result.reasons == []
