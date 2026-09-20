@@ -1,6 +1,7 @@
 """Step 5.3 guard rails: counting recent activity per card in Redis."""
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from src.api.schemas import Transaction
 from src.features.velocity import (
@@ -163,3 +164,91 @@ def test_a_card_that_goes_quiet_expires(redis_client, make_transaction):
     store = VelocityStore(redis_client, retention=120)
     store.measure([make_transaction("tx-1")])
     assert 0 < redis_client.ttl(key_for("card-00001")) <= 120
+
+
+# ------------------------------------------ Redis is down (Step 5.6)
+class FakeClock:
+    """A clock that only moves when a test says so."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class DeadRedis:
+    """A client that refuses every command, counting the attempts."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    def pipeline(self, transaction=False):
+        self.attempts += 1
+        raise RedisConnectionError("Error 111 connecting to redis:6379. Connection refused.")
+
+    def ping(self):
+        self.attempts += 1
+        raise RedisConnectionError("Error 111 connecting to redis:6379. Connection refused.")
+
+
+def dead_store(clock):
+    return VelocityStore(DeadRedis(), clock=clock, monotonic=clock, retry_after=10)
+
+
+def test_a_failure_costs_the_features_not_the_transactions(make_transaction, caplog):
+    clock = FakeClock()
+    store = dead_store(clock)
+    with caplog.at_level("WARNING"):
+        features = store.measure_or_none([make_transaction("tx-1"), make_transaction("tx-2")])
+    assert features == [None, None]
+    assert "velocity unavailable, retrying in 10s" in caplog.text
+
+
+def test_redis_is_left_alone_after_a_failure(make_transaction):
+    """A name that no longer resolves takes ~4s to fail; paying that per transaction is worse
+    than going without the features for a while."""
+    clock = FakeClock()
+    store = dead_store(clock)
+    store.measure_or_none([make_transaction("tx-1")])
+    assert store.is_resting()
+
+    for _ in range(50):
+        assert store.measure_or_none([make_transaction("tx-2")]) == [None]
+    assert store.client.attempts == 1  # only the first transaction paid for the failure
+
+
+def test_one_call_per_window_tries_again(make_transaction):
+    clock = FakeClock()
+    store = dead_store(clock)
+    store.measure_or_none([make_transaction("tx-1")])
+    clock.now += 10
+    assert not store.is_resting()
+    store.measure_or_none([make_transaction("tx-2")])
+    assert store.client.attempts == 2
+
+
+def test_health_answers_at_once_while_resting():
+    clock = FakeClock()
+    store = dead_store(clock)
+    assert store.ping() is False
+    assert store.ping() is False
+    assert store.client.attempts == 1  # the second answer came from the resting window
+
+
+@pytest.mark.redis
+def test_recovery_reports_how_many_transactions_went_without(
+    redis_client, make_transaction, caplog
+):
+    clock = FakeClock()
+    store = VelocityStore(redis_client, clock=clock, monotonic=clock, retry_after=10)
+    store.client = DeadRedis()
+    store.measure_or_none([make_transaction("tx-1"), make_transaction("tx-2")])
+    store.measure_or_none([make_transaction("tx-3")])  # skipped: still resting
+
+    store.client = redis_client
+    clock.now += 10
+    with caplog.at_level("INFO"):
+        (features,) = store.measure_or_none([make_transaction("tx-4")])
+    assert features.count_1m == 1  # only tx-4 was ever recorded
+    assert "3 transaction(s) were scored without it" in caplog.text

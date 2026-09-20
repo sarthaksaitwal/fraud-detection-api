@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
 
@@ -59,6 +60,9 @@ RETENTION_SECONDS = WINDOWS_SECONDS[-1]
 # past any velocity threshold, and the cap bounds both Redis memory and the work
 # of reading a window back.
 MAX_EVENTS_PER_CARD = 256
+
+# How long Redis is left alone after a failure, before one call tries again.
+RETRY_AFTER_SECONDS = 10.0
 
 
 def member_for(transaction: Transaction) -> str:
@@ -112,11 +116,45 @@ class VelocityStore:
         retention: float = RETENTION_SECONDS,
         max_events: int = MAX_EVENTS_PER_CARD,
         clock: Callable[[], float] = time.time,
+        retry_after: float = RETRY_AFTER_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.client = client
         self._retention = retention
         self._max_events = max_events
+        # Two clocks on purpose: events are stamped with wall-clock time, which
+        # is what a window means, while the retry window is measured with a
+        # monotonic clock that a system time change cannot move.
         self._clock = clock
+        self._monotonic = monotonic
+        self._retry_after = retry_after
+        self._lock = threading.Lock()
+        self._down_until = 0.0
+        self._skipped = 0  # transactions scored without features since Redis last worked
+
+    # ------------------------------------------------------------- availability
+    def is_resting(self) -> bool:
+        """True while Redis is being left alone after a failure."""
+        return self._monotonic() < self._down_until
+
+    def _failed(self, exc: RedisError, skipped: int = 0) -> None:
+        with self._lock:
+            self._down_until = self._monotonic() + self._retry_after
+            self._skipped += skipped
+            total = self._skipped
+        log.warning(
+            "velocity unavailable, retrying in %.0fs (%d transaction(s) scored without it): %s: %s",
+            self._retry_after,
+            total,
+            type(exc).__name__,
+            exc,
+        )
+
+    def _recovered(self) -> None:
+        with self._lock:
+            skipped, self._skipped = self._skipped, 0
+        if skipped:
+            log.info("velocity is back; %d transaction(s) were scored without it", skipped)
 
     def measure(
         self, transactions: Iterable[Transaction], now: float | None = None
@@ -161,21 +199,39 @@ class VelocityStore:
         """`measure`, but a Redis failure costs the features rather than the transaction.
 
         Velocity is a signal, not a gate: refusing a payment because a cache is
-        down would be a worse outage than scoring without the signal. Step 5.6
-        adds a resting window, so a Redis that is down is not retried on every
-        transaction.
+        down would be a worse outage than scoring without the signal.
+
+        A Redis that is down is slow to fail, not quick -- a name that no longer
+        resolves takes about four seconds in Docker, which no socket timeout
+        covers. So after a failure the store stops trying for `retry_after`
+        seconds and returns nothing instantly, and only one call per window pays
+        to find out whether Redis is back. The decision store does the same
+        (src/storage/store.py).
         """
         transactions = list(transactions)
-        try:
-            return self.measure(transactions)
-        except RedisError as exc:
-            log.warning(
-                "velocity unavailable, scoring %d transaction(s) without it: %s: %s",
-                len(transactions),
-                type(exc).__name__,
-                exc,
-            )
+        if self.is_resting():
+            with self._lock:
+                self._skipped += len(transactions)
             return [None] * len(transactions)
+        try:
+            features = self.measure(transactions)
+        except RedisError as exc:
+            self._failed(exc, len(transactions))
+            return [None] * len(transactions)
+        self._recovered()
+        return features
+
+    def ping(self) -> bool:
+        """Can Redis be reached? Answers instantly while resting, for /health."""
+        if self.is_resting():
+            return False
+        try:
+            self.client.ping()
+        except RedisError as exc:
+            self._failed(exc)
+            return False
+        self._recovered()
+        return True
 
     def card_count(self, card_id: str) -> int:
         """Events currently kept for a card. For tests and the dashboard, not scoring."""
