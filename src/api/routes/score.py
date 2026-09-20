@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
@@ -12,6 +14,8 @@ from src.features.velocity import VelocityStore
 from src.observability.metrics import record_results
 from src.scoring import Scorer
 from src.storage.store import DecisionStore
+
+log = logging.getLogger("src.api.score")
 
 router = APIRouter(tags=["scoring"])
 
@@ -39,11 +43,23 @@ def score(
 ) -> RiskResult:
     # Velocity is measured first: it describes the card as of this transaction,
     # and recording it in Redis is part of measuring it.
+    started = time.perf_counter()
     (features,) = measure(velocity, [transaction])
+    measured = time.perf_counter()
     result = scorer.score_one(transaction, features)
+    scored = time.perf_counter()
     record_results([result], source="api")
     if store is not None:
         store.record([result])
+    # At DEBUG only: which of the three a slow request was waiting on. Phase 6
+    # used this to find where /score's time actually goes.
+    log.debug(
+        "scored %s: velocity %.1fms, model %.1fms, record %.1fms",
+        result.transaction_id,
+        (measured - started) * 1000,
+        (scored - measured) * 1000,
+        (time.perf_counter() - scored) * 1000,
+    )
     return result
 
 

@@ -47,6 +47,9 @@ metrics:  ## show the API's and the consumer's Prometheus metrics
 	@curl -s http://127.0.0.1:8000/metrics | grep -E '^fraud_' | head -40
 	@curl -s http://127.0.0.1:8001/metrics | grep -E '^fraud_consumer' | head -10
 
+load-test:  ## drive POST /score at rising concurrency and find the knee
+	$(PY) -m scripts.load_test --out data/load-test.json
+
 psql:     ## open a SQL shell on the Compose database
 	docker compose exec postgres psql -U fraud -d fraud
 
@@ -80,5 +83,5 @@ produce:  ## stream the test set into Kafka at PRODUCER_RATE_PER_SEC
 consume:  ## score transactions from Kafka into Postgres (Ctrl+C to stop)
 	$(PY) -m scripts.consume
 
-.PHONY: help install data train api test lint fmt image up down logs psql init-db test-postgres kafka check-kafka test-kafka redis check-redis test-redis produce consume stream dashboard metrics
+.PHONY: help install data train api test lint fmt image up down logs psql init-db test-postgres kafka check-kafka test-kafka redis check-redis test-redis produce consume stream dashboard metrics load-test
 

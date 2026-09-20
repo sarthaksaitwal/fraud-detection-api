@@ -41,10 +41,16 @@ RUN apt-get update \
 RUN groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --no-create-home app
 
+# OMP_NUM_THREADS=1: one OpenMP thread per process. XGBoost is saved with
+# n_jobs=-1, so each prediction would otherwise start a thread per core. Scoring
+# one transaction gains nothing from that, and when several are scored at once
+# the pools fight each other: Step 6.5 measured the same prediction at 6 ms with
+# one thread and anywhere from 7 ms to 180 ms with eight. Scale with processes.
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    ENVIRONMENT=docker
+    ENVIRONMENT=docker \
+    OMP_NUM_THREADS=1
 
 WORKDIR /app
 
