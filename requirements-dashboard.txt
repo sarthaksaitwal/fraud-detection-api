@@ -1,0 +1,8 @@
+# The dashboard image: everything in the API image, plus Streamlit and its charts
+# (Step 6.6). Kept out of the API image, which has no business growing a web UI's
+# dependencies: Streamlit alone brings pyarrow, altair, tornado and a bundled
+# front end, none of which may ever sit in the path of a decision.
+-r requirements-api.txt
+
+streamlit==1.63.0
+plotly==7.0.0

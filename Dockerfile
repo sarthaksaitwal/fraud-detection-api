@@ -2,6 +2,7 @@
 #
 #   docker build -t fraud-detection-api .                                # API and consumer
 #   docker build --target producer -t fraud-detection-producer .         # producer
+#   docker build --target dashboard -t fraud-detection-dashboard .       # dashboard
 #   docker run --rm -p 8000:8000 -e PERSIST_DECISIONS=false fraud-detection-api
 #
 # Needs models/fraud_model.joblib and models/model_metadata.json: run
@@ -28,6 +29,11 @@ RUN pip install -r requirements-api.txt
 FROM build AS build-producer
 COPY requirements-producer.txt .
 RUN pip install -r requirements-producer.txt
+
+# The dashboard adds Streamlit and plotly on top of the same libraries.
+FROM build AS build-dashboard
+COPY requirements-dashboard.txt .
+RUN pip install -r requirements-dashboard.txt
 
 # ---------------------------------------------------------------- shared base
 FROM python:3.10-slim-bookworm AS base
@@ -63,6 +69,32 @@ COPY src/ src/
 COPY scripts/ scripts/
 USER app
 ENTRYPOINT ["python", "-m", "scripts.produce"]
+
+# ------------------------------------------------------------------ dashboard
+# The analyst view (Step 6.6). It reads the decisions table and nothing else:
+# no model is copied in, so this image cannot score a transaction even by accident.
+FROM base AS dashboard
+COPY --from=build-dashboard /opt/venv /opt/venv
+COPY src/ src/
+COPY dashboard/ dashboard/
+
+# Streamlit writes its config and cache under $HOME, and the app user has no home
+# directory. /tmp is writable; nothing it puts there needs to survive a restart.
+ENV HOME=/tmp \
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+
+USER app
+
+EXPOSE 8501
+
+# Streamlit's own liveness endpoint, which answers once the server is accepting
+# browsers. It says nothing about Postgres: the dashboard is meant to start, and
+# stay up, while the database it reads is down.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=4)"]
+
+CMD ["streamlit", "run", "dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
 
 # ------------------------------------------------------------- API / consumer
 # The default target, so a plain `docker build .` still builds the API.

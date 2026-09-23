@@ -28,7 +28,7 @@ fmt:      ## autoformat
 image:    ## build the API image                         (Phase 3)
 	docker build -t fraud-detection-api .
 
-up:       ## start the pipeline in Docker: API, consumer, Postgres, Kafka
+up:       ## start everything in Docker: API, consumer, dashboard, Postgres, Kafka, Redis
 	docker compose up -d --build
 
 down:     ## stop the containers; decisions are kept
@@ -40,7 +40,7 @@ logs:     ## follow the API and consumer logs
 stream:   ## stream 1,000 test transactions in through the producer container (Phase 4)
 	docker compose run --rm producer --limit 1000 --rate 100
 
-dashboard:  ## open the decisions dashboard                (Phase 6)
+dashboard:  ## run the dashboard locally; `make up` also serves it on :8501
 	$(PY) -m streamlit run dashboard/app.py
 
 metrics:  ## show the API's and the consumer's Prometheus metrics

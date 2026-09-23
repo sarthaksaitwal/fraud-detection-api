@@ -6,8 +6,10 @@
 
 !requirements-api.txt
 !requirements-producer.txt
+!requirements-dashboard.txt
 !src/
 !scripts/
+!dashboard/
 !models/fraud_model.joblib
 !models/model_metadata.json
 

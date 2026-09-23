@@ -11,12 +11,17 @@
 
 name: fraud-detection
 
+# Where the decisions live. Its own block because the dashboard needs this and
+# nothing else from the scoring settings below: it reads the table, it does not
+# score. Inside the Compose network services are reached by their service names.
+x-database-environment: &database-environment
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-fraud}:${POSTGRES_PASSWORD:-fraud}@postgres:5432/${POSTGRES_DB:-fraud}
+
 # Settings the API and the consumer must share, so a transaction gets the same
 # decision whichever way it arrives. Not `env_file: .env`, which would also bring
 # in the 127.0.0.1 addresses that are wrong inside a container.
 x-scoring-environment: &scoring-environment
-  # Inside the Compose network services are reached by their service names.
-  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-fraud}:${POSTGRES_PASSWORD:-fraud}@postgres:5432/${POSTGRES_DB:-fraud}
+  <<: *database-environment
   PERSIST_DECISIONS: "true"
   REDIS_URL: redis://redis:6379/0
   VELOCITY_FEATURES: ${VELOCITY_FEATURES:-true}
@@ -210,6 +215,28 @@ services:
     # On `docker compose stop` the consumer finishes and commits its current batch.
     # A batch takes well under a second; 30s leaves room for a slow database.
     stop_grace_period: 30s
+    restart: unless-stopped
+
+  dashboard:
+    # The analyst view of what the pipeline decided, at http://127.0.0.1:8501
+    # (Step 6.6). It only reads Postgres, so it is never in the path of a
+    # decision: a slow or broken dashboard cannot slow down a payment.
+    build:
+      context: .
+      target: dashboard
+    image: fraud-detection-dashboard
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *database-environment
+      # Drawn as lines on the risk histogram, so they must be the thresholds the
+      # scorer actually used.
+      REVIEW_THRESHOLD: ${REVIEW_THRESHOLD:-0.24}
+      BLOCK_THRESHOLD: ${BLOCK_THRESHOLD:-0.95}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-8501}:8501"
     restart: unless-stopped
 
   producer:

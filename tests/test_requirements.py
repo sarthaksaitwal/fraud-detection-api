@@ -9,6 +9,7 @@ from src.ml.artifact import TRACKED_LIBRARIES
 
 SERVICE_REQUIREMENTS = PROJECT_ROOT / "requirements-api.txt"
 PRODUCER_REQUIREMENTS = PROJECT_ROOT / "requirements-producer.txt"
+DASHBOARD_REQUIREMENTS = PROJECT_ROOT / "requirements-dashboard.txt"
 # name[extras]==version
 PIN = re.compile(r"(?P<name>[A-Za-z0-9_.-]+)(\[[^\]]*\])?==(?P<version>\S+)")
 # `-r other-file.txt`: include another requirements file.
@@ -35,7 +36,9 @@ def pins(path=SERVICE_REQUIREMENTS):
 
 
 @pytest.mark.parametrize(
-    "path", [SERVICE_REQUIREMENTS, PRODUCER_REQUIREMENTS], ids=lambda p: p.name
+    "path",
+    [SERVICE_REQUIREMENTS, PRODUCER_REQUIREMENTS, DASHBOARD_REQUIREMENTS],
+    ids=lambda p: p.name,
 )
 def test_every_image_requirement_is_pinned_exactly(path):
     loose = [
@@ -64,3 +67,11 @@ def test_the_producer_image_has_everything_the_service_image_has_plus_parquet():
     assert service.items() <= producer.items()
     assert "pyarrow" in producer
     assert "pyarrow" not in service
+
+
+def test_the_dashboard_image_has_streamlit_and_the_service_image_does_not():
+    """Streamlit and its front end have no business in the path of a decision."""
+    service, dashboard = pins(SERVICE_REQUIREMENTS), pins(DASHBOARD_REQUIREMENTS)
+    assert service.items() <= dashboard.items()
+    assert {"streamlit", "plotly"} <= dashboard.keys()
+    assert "streamlit" not in service
