@@ -1,6 +1,8 @@
 """The fraud operations dashboard (Step 6.3).
 
-    streamlit run dashboard/app.py          # or: make dashboard
+    make dashboard                          # from the project root
+    streamlit run dashboard/app.py          # the same thing, by hand
+    cd dashboard && streamlit run app.py    # also works, see sys.path below
 
 Reads the decisions the API and the consumer have recorded, straight from
 Postgres. It is a reader: it opens its own pool, runs SELECTs, and is never in
@@ -12,11 +14,23 @@ is layout and nothing else.
 
 from __future__ import annotations
 
-import plotly.graph_objects as go
-import streamlit as st
-from sqlalchemy.exc import SQLAlchemyError
+import sys
+from pathlib import Path
 
-from dashboard.data import (
+# Streamlit puts this file's own folder on sys.path, not the project root, so
+# `dashboard.data` and `src` are only importable when the root happens to be
+# there as well -- it is with `python -m streamlit`, and it is not with a bare
+# `streamlit run app.py`. Adding it here makes the app run the same way from
+# anywhere, before the first import that needs it.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import plotly.graph_objects as go  # noqa: E402
+import streamlit as st  # noqa: E402
+from sqlalchemy.exc import SQLAlchemyError  # noqa: E402
+
+from dashboard.data import (  # noqa: E402
     MAX_ROWS,
     WINDOWS,
     bucket_seconds_for,
@@ -32,10 +46,10 @@ from dashboard.data import (
     since_for,
     summarise,
 )
-from src.config import settings
-from src.features.rules import describe
-from src.storage.db import create_db_engine
-from src.storage.store import failure_reason
+from src.config import settings  # noqa: E402
+from src.features.rules import describe  # noqa: E402
+from src.storage.db import create_db_engine  # noqa: E402
+from src.storage.store import failure_reason  # noqa: E402
 
 # The colours mean the same thing on every chart: green is money taken, amber is
 # an analyst's time, red is a customer refused.
